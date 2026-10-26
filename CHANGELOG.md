@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1-dev.1 (unreleased)
+
+- Port bounded piece caches and sliding stream windows from fork commits `586a129` and `88eb0ab`, retaining owned buffers and 2.0.0 Android/Range fixes.
+- Restore file sizes in the FFI file list and verify existing local files when no resume state is supplied.
+- Serialize cache eviction and metadata/startup priority changes; keep idle seeds connected for streaming.
+- Rebuild against libtorrent 2.1.1 using exported ABI settings; restore all-platform CI and iOS/macOS artifact builders.
+- Require matching rebuilt native artifacts or an explicit release URL. macOS builds target 11.0+, iOS builds target 13.0+.
+- Add native cache/HTTP regression tests, FFI export checks and deterministic Flutter smoke tests.
+
 ## 2.0.0
 - **Android 16 Support (16 KB page sizes)**: Rebuilt Android prebuilt native libraries (`liblibtorrent_flutter.so`) with the `-Wl,-z,max-page-size=16384` linker flag to ensure compatibility with Android 16 (API 36+) devices and satisfy Google Play Console requirements.
 - **Fix Android "Failed to recognize file format"**: Fixed a critical bug in `parse_range` where suffix byte range requests (e.g., `Range: bytes=-500`) were incorrectly parsed as `start=0, end=500`. This caused the engine to serve the beginning of the file instead of the end, breaking metadata (moov atom / ID3) probing for media players like `media_kit` on Android.

@@ -1,9 +1,9 @@
 Pod::Spec.new do |s|
   s.name             = 'libtorrent_flutter'
-  s.version          = '1.7.0'
+  s.version          = '2.0.1-dev.1'
   s.summary          = 'Flutter plugin for libtorrent with built-in streaming server.'
   s.description      = <<-DESC
-  Native libtorrent 2.0 bindings for Flutter with an integrated HTTP streaming server.
+  Native libtorrent 2.1.1 bindings for Flutter with an integrated HTTP streaming server.
                        DESC
   s.homepage         = 'https://github.com/ayman708-UX/libtorrent_flutter'
   s.license          = { :type => 'GPL-3.0', :file => '../LICENSE' }
@@ -11,8 +11,8 @@ Pod::Spec.new do |s|
   s.source           = { :path => '.' }
 
   s.dependency 'FlutterMacOS'
-  s.platform = :osx, '10.14'
-  s.osx.deployment_target = '10.14'
+  s.platform = :osx, '11.0'
+  s.osx.deployment_target = '11.0'
   s.swift_version = '5.0'
 
   # Check for prebuilt dylib first
@@ -24,13 +24,13 @@ Pod::Spec.new do |s|
   # matching GitHub Release on first `pod install`. Set the env var
   # LIBTORRENT_FLUTTER_SKIP_DOWNLOAD=1 to opt out.
   # ───────────────────────────────────────────────────────────────────────
-  if !File.exist?(prebuilt_absolute) && ENV['LIBTORRENT_FLUTTER_SKIP_DOWNLOAD'] != '1'
+  if !File.exist?(prebuilt_absolute) && ENV['LIBTORRENT_FLUTTER_SKIP_DOWNLOAD'] != '1' && ENV['LIBTORRENT_FLUTTER_RELEASE_BASE_URL']
     pubspec_path = File.expand_path(File.join(__dir__, '..', 'pubspec.yaml'))
     if File.exist?(pubspec_path)
       version_match = File.read(pubspec_path).match(/^version:\s*(\S+)/)
       if version_match
         plugin_version = version_match[1]
-        zip_url  = "https://github.com/ayman708-UX/libtorrent_flutter/releases/download/v#{plugin_version}/macos-native-lib.zip"
+        zip_url  = "#{ENV['LIBTORRENT_FLUTTER_RELEASE_BASE_URL']}/macos-native-lib.zip"
         zip_path = File.join(__dir__, '.macos-native-lib.zip')
         Pod::UI.puts "libtorrent_flutter: downloading prebuilt dylib from #{zip_url}"
         begin
@@ -39,13 +39,13 @@ Pod::Spec.new do |s|
           URI.open(zip_url) { |remote| File.binwrite(zip_path, remote.read) }
           # CI artifact root corresponds to prebuilt/macos/, so the zip
           # contains universal/liblibtorrent_flutter.dylib.
-          system("/usr/bin/unzip -o -q '#{zip_path}' -d '#{__dir__}'") || raise('unzip failed')
+          system('/usr/bin/unzip', '-o', '-q', zip_path, '-d', __dir__) || raise('unzip failed')
           extracted = File.join(__dir__, 'universal', 'liblibtorrent_flutter.dylib')
           FileUtils.mv(extracted, prebuilt_absolute) if File.exist?(extracted)
           FileUtils.rm_rf(File.join(__dir__, 'universal'))
           File.delete(zip_path) if File.exist?(zip_path)
         rescue => e
-          Pod::UI.warn "libtorrent_flutter: prebuilt download failed (#{e.message}); falling back to source build"
+          Pod::UI.warn "libtorrent_flutter: prebuilt download failed (#{e.message}); provide a matching rebuilt native artifact"
           File.delete(zip_path) if File.exist?(zip_path)
         end
       end
@@ -58,22 +58,6 @@ Pod::Spec.new do |s|
     s.vendored_libraries = openssl_dylibs
     s.source_files = 'Classes/**/*.swift'
   else
-    # Build from source — needs Homebrew libtorrent
-    s.source_files = 'Classes/**/*'
-    s.pod_target_xcconfig = {
-      'DEFINES_MODULE' => 'YES',
-      'HEADER_SEARCH_PATHS' => [
-        '"$(PODS_TARGET_SRCROOT)/../src"',
-        '"/opt/homebrew/include"',
-        '"/usr/local/include"',
-      ].join(' '),
-      'LIBRARY_SEARCH_PATHS' => [
-        '"/opt/homebrew/lib"',
-        '"/usr/local/lib"',
-      ].join(' '),
-      'OTHER_LDFLAGS' => '-ltorrent-rasterbar -lboost_system -lssl -lcrypto',
-      'OTHER_CPLUSPLUSFLAGS' => '-std=c++17 -DTORRENT_BRIDGE_EXPORTS -DTORRENT_NO_DEPRECATE',
-      'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    }
+    raise 'Missing rebuilt macos native library. Run bash scripts/build_apple.sh macos from the plugin root, or set LIBTORRENT_FLUTTER_RELEASE_BASE_URL to your matching release directory.'
   end
 end

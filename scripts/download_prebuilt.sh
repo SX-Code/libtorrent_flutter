@@ -1,30 +1,22 @@
 #!/usr/bin/env bash
 # download_prebuilt.sh — Download prebuilt native libraries from a GitHub Release
-# Usage: ./scripts/download_prebuilt.sh [version]
-# Example: ./scripts/download_prebuilt.sh 1.9.2
+# Usage: LIBTORRENT_FLUTTER_RELEASE_BASE_URL=<release-directory-url> bash scripts/download_prebuilt.sh
 set -euo pipefail
 
-REPO="ayman708-UX/libtorrent_flutter"
-VERSION="${1:-}"
-
-if [ -z "$VERSION" ]; then
-  # Get latest release version
-  VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | \
-    grep '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
-  echo "Latest version: $VERSION"
-fi
-
-BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
+BASE_URL="${LIBTORRENT_FLUTTER_RELEASE_BASE_URL:?Set to the matching release directory, e.g. https://github.com/OWNER/REPO/releases/download/v2.0.1-dev.1}"
+cd "$(dirname "$0")/.."
+DOWNLOAD_DIR="$(mktemp -d)"
+trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 
 download_and_extract() {
   local name="$1"
   local dest="$2"
   local zip="${name}.zip"
   echo "→ Downloading ${zip}..."
-  curl -fsSL "${BASE_URL}/${zip}" -o "/tmp/${zip}"
+  curl -fsSL "${BASE_URL}/${zip}" -o "${DOWNLOAD_DIR}/${zip}"
   mkdir -p "$dest"
-  unzip -o "/tmp/${zip}" -d "$dest"
-  rm "/tmp/${zip}"
+  unzip -o "${DOWNLOAD_DIR}/${zip}" -d "$dest"
+  rm "${DOWNLOAD_DIR}/${zip}"
   echo "  ✅ Extracted to ${dest}"
 }
 
@@ -35,7 +27,7 @@ download_and_extract "linux-native-lib-arm64" "prebuilt/linux/arm64"
 # macOS
 download_and_extract "macos-native-lib" "prebuilt/macos"
 mkdir -p macos
-cp prebuilt/macos/universal/liblibtorrent_flutter.dylib macos/ 2>/dev/null || true
+cp prebuilt/macos/universal/liblibtorrent_flutter.dylib macos/
 
 # Windows
 download_and_extract "windows-native-lib-x64"   "prebuilt/windows/x64"
@@ -51,12 +43,7 @@ mkdir -p prebuilt/ios
 download_and_extract "ios-native-lib" "prebuilt/ios/libtorrent_flutter.xcframework"
 # Also copy to ios/ for CocoaPods
 rm -rf ios/libtorrent_flutter.xcframework
-cp -R prebuilt/ios/libtorrent_flutter.xcframework ios/ 2>/dev/null || true
+cp -R prebuilt/ios/libtorrent_flutter.xcframework ios/
 
-# Download CA bundle for Android WebTorrent
-echo "→ Downloading Mozilla CA bundle..."
-curl -fsSL "https://curl.se/ca/cacert.pem" -o assets/cacert.pem
-echo "  ✅ cacert.pem downloaded ($(wc -c < assets/cacert.pem) bytes)"
-
-echo ""
-echo "✅ All prebuilt libraries downloaded for version ${VERSION}"
+# Keep the reviewed certificate bundle shipped with this source version.
+echo "All platform artifacts downloaded from ${BASE_URL}"

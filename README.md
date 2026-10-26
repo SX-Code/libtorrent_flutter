@@ -1,20 +1,30 @@
 # libtorrent_flutter
 
-The only Flutter package wrapping **libtorrent 2.1.1** — the same C++ engine powering qBittorrent, Deluge, and Transmission. Add a magnet link, pick a file, get a stream URL. Works on Windows, Linux, macOS, iOS, and Android — prebuilt native binaries are fetched on first build from the matching GitHub Release.
+Native **libtorrent 2.1.1** bindings for Flutter with a local HTTP streaming server.
+This development branch ports the 1.8.7 fork's bounded cache and sliding download
+window onto the 2.0.0 source snapshot. It targets iOS, macOS, Android, Linux and Windows.
+
+**Development version: 2.0.1-dev.1.** Native libraries must be rebuilt from this
+source. Old 1.8.7 binaries are incompatible with the Dart FFI exports. No default
+download from the removed upstream repository is attempted.
+
+Use a local path dependency while validating this branch:
 
 ```yaml
 dependencies:
-  libtorrent_flutter: ^2.0.0
+  libtorrent_flutter:
+    path: /path/to/libtorrent_flutter-2.0.0
 ```
 
-> **First build downloads ~10–80 MB of native binaries** from the matching
-> [GitHub Release](https://github.com/ayman708-UX/libtorrent_flutter/releases)
-> (pub.dev's 100 MB tarball limit can't hold the libtorrent + OpenSSL static
-> libs for every platform). The download is wired into Gradle / CMake /
-> CocoaPods and only happens once per package version. See
-> [Offline / air-gapped builds](#offline--air-gapped-builds) below to opt out.
+On a Mac with Xcode, CMake and Ninja installed:
 
----
+```bash
+bash scripts/build_apple.sh all
+```
+
+The GitHub Actions workflow builds all five platforms and uploads artifacts; it
+does not publish releases. See [移植实施记录.md](移植实施记录.md) for the migration,
+validation status, supported architectures and artifact installation paths.
 
 ## Why libtorrent?
 
@@ -180,6 +190,8 @@ No changes needed on Windows, Linux, and Android — everything is bundled.
 ```xml
 <key>com.apple.security.network.client</key>
 <true/>
+<key>com.apple.security.network.server</key>
+<true/>
 ```
 
 **Android** — add to `AndroidManifest.xml`:
@@ -200,26 +212,22 @@ FlutterForegroundTask.startService(
 
 ---
 
-## Offline / air-gapped builds
+## Native artifacts and offline builds
 
-Native binaries are downloaded from the matching
-[GitHub Release](https://github.com/ayman708-UX/libtorrent_flutter/releases)
-on the first build (Gradle / CMake / CocoaPods do this automatically — pub
-itself never runs the download). To opt out:
+Build with `.github/workflows/build.yml` or the Apple script above. Install the
+artifacts at the paths documented in [移植实施记录.md](移植实施记录.md).
+For a release you control, optionally set `LIBTORRENT_FLUTTER_RELEASE_BASE_URL`
+to its full directory URL, such as
+`https://github.com/OWNER/REPO/releases/download/v2.0.1-dev.1`.
+The Gradle, CMake, CocoaPods and download-script paths use this same variable.
+The artifacts must match this source revision; version naming alone does not
+validate ABI compatibility.
 
-| Platform | How to skip the download |
-|---|---|
-| Android | `flutter build apk -PlibtorrentFlutterSkipDownload=true` (or set in `gradle.properties`). Limit ABIs with `-PlibtorrentFlutterAbis=arm64-v8a`. |
-| Windows | Pass `-DLIBTORRENT_FLUTTER_SKIP_DOWNLOAD=ON` to CMake (e.g. via `windows/runner/CMakeLists.txt` or `--cmake-args`). |
-| Linux   | Same: `-DLIBTORRENT_FLUTTER_SKIP_DOWNLOAD=ON`. |
-| macOS   | `LIBTORRENT_FLUTTER_SKIP_DOWNLOAD=1 pod install` (run from `macos/`). |
-| iOS     | `LIBTORRENT_FLUTTER_SKIP_DOWNLOAD=1 pod install` (run from `ios/`). |
-
-When you opt out, drop the relevant binaries into the package's `prebuilt/`
-directory yourself (paths match the layout in the GitHub Release zips), or
-let the per-platform CMake/Gradle path build from source — `src/` ships
-with the package and contains everything needed for a from-source build
-given libtorrent + OpenSSL + Boost on the host.
+Without a release URL, iOS/macOS/Android require locally supplied rebuilt
+artifacts. Linux and Windows can fall back to CMake using an installed
+libtorrent 2.1.1 configured with `deprecated-functions=ON` and `webtorrent=OFF`.
+An offline build also requires Flutter packages and native dependencies to have
+been downloaded beforehand.
 
 ---
 

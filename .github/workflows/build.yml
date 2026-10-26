@@ -1,0 +1,391 @@
+name: Build and verify native libraries
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LIBTORRENT_VERSION: "2.1.1"
+  LIBTORRENT_FLUTTER_SKIP_DOWNLOAD: "1"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # LINUX BUILD (static libtorrent, x64 + arm64)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            # GitHub's native ARM64 Linux runner — free for public repos.
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libboost-all-dev libssl-dev \
+            cmake g++ ninja-build pkg-config \
+            libgtk-3-dev xvfb
+
+      - name: Build libtorrent (static)
+        run: |
+          git clone --depth 1 --branch v${LIBTORRENT_VERSION} \
+            --recurse-submodules https://github.com/arvidn/libtorrent.git libtorrent-src
+          mkdir -p libtorrent-src/build && cd libtorrent-src/build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -Ddeprecated-functions=ON -Dwebtorrent=OFF \
+            -G Ninja -Wno-dev
+          ninja -j$(nproc)
+          echo "=== Static lib ==="
+          find . -name "*.a" | head -5
+        timeout-minutes: 20
+
+      - name: Build bridge and run native regression tests
+        run: |
+          cmake --install libtorrent-src/build --prefix "$PWD/lt-install"
+          MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH)
+          cmake -S src -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/lt-install" -DLTF_BUILD_TESTS=ON \
+            -DOPENSSL_SSL_LIBRARY=/usr/lib/${MULTIARCH}/libssl.a \
+            -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/${MULTIARCH}/libcrypto.a
+          cmake --build build-linux --parallel 2
+          ctest --test-dir build-linux --output-on-failure
+          if ldd build-linux/liblibtorrent_flutter.so | grep -E 'libssl|libcrypto|not found'; then
+            echo 'Unexpected runtime dependency' >&2
+            exit 1
+          fi
+
+      - name: Copy to prebuilt
+        run: |
+          mkdir -p prebuilt/linux/${{ matrix.arch }}
+          cp build-linux/liblibtorrent_flutter.so prebuilt/linux/${{ matrix.arch }}/
+          ls -la prebuilt/linux/${{ matrix.arch }}/
+
+      - name: Setup Flutter
+        if: matrix.arch == 'x64'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Run Dart smoke test
+        if: matrix.arch == 'x64'
+        run: |
+          python3 scripts/prepare_example.py linux
+          cd example
+          flutter pub get
+          xvfb-run flutter test integration_test/ -d linux --timeout 60s
+
+      - name: Verify FFI exports
+        run: python3 scripts/check_native_exports.py prebuilt/linux/${{ matrix.arch }}/liblibtorrent_flutter.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-lib-${{ matrix.arch }}
+          path: prebuilt/linux/${{ matrix.arch }}/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # MACOS BUILD (universal2 dylib: arm64 + x86_64, both cross-compiled on
+  # an arm64 runner — GitHub no longer offers macos-13 Intel runners as of
+  # the macos-14 / macos-15 era. Apple's clang handles -arch x86_64 fine,
+  # but Homebrew on Apple Silicon only ships arm64 binaries, so we
+  # cross-compile OpenSSL ourselves for both slices and use Boost
+  # (headers-only as far as libtorrent's compile is concerned).
+  # ═══════════════════════════════════════════════════════════════════════════════
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake ninja
+      - name: Build universal dylib and run native regression tests
+        run: bash scripts/build_apple.sh macos
+        timeout-minutes: 90
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Flutter integration
+        run: |
+          python3 scripts/prepare_example.py macos
+          cd example
+          flutter pub get
+          flutter test integration_test/ -d macos --timeout 120s
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-lib
+          path: prebuilt/macos/
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            triplet: x64-windows-static
+            cmake_arch: x64
+          - arch: arm64
+            triplet: arm64-windows-static
+            cmake_arch: ARM64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        run: |
+          if (!(Test-Path C:\vcpkg\.git)) {
+            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          # Pin dependency recipes; libtorrent itself is built from source below.
+          git -C C:\vcpkg fetch origin aae277acf4e7de287ddb5e208b5316614de6aad7
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C C:\vcpkg checkout aae277acf4e7de287ddb5e208b5316614de6aad7
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          C:\vcpkg\bootstrap-vcpkg.bat
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Install Boost and OpenSSL
+        run: C:\vcpkg\vcpkg.exe install boost-headers:${{ matrix.triplet }} openssl:${{ matrix.triplet }}
+        timeout-minutes: 90
+
+      - name: Build libtorrent and bridge
+        run: |
+          git clone --depth 1 --branch v${{ env.LIBTORRENT_VERSION }} --recurse-submodules https://github.com/arvidn/libtorrent.git libtorrent-src
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S libtorrent-src -B build-libtorrent -A ${{ matrix.cmake_arch }} -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DBUILD_SHARED_LIBS=OFF -Dstatic_runtime=ON -Ddeprecated-functions=ON -Dwebtorrent=OFF -DCMAKE_INSTALL_PREFIX="$pwd/lt-install"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build-libtorrent --config Release --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --install build-libtorrent --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S src -B build-win -A ${{ matrix.cmake_arch }} -DCMAKE_PREFIX_PATH="$pwd/lt-install" -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLTF_BUILD_TESTS=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build-win --config Release --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Native regression tests
+        if: matrix.arch == 'x64'
+        run: ctest --test-dir build-win -C Release --output-on-failure
+
+      - name: Copy to prebuilt
+        run: |
+          New-Item -ItemType Directory -Force "prebuilt\windows\${{ matrix.arch }}"
+          Get-ChildItem -Path build-win -Recurse -Filter "*.dll" | Copy-Item -Destination "prebuilt\windows\${{ matrix.arch }}\"
+          Get-ChildItem "prebuilt\windows\${{ matrix.arch }}\"
+
+      - name: Setup Flutter
+        if: matrix.arch == 'x64'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Run Dart smoke test
+        if: matrix.arch == 'x64'
+        run: |
+          python scripts/prepare_example.py windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cd example
+          flutter pub get
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          flutter test integration_test/ -d windows --timeout 60s
+
+      - name: Verify FFI exports
+        if: matrix.arch == 'x64'
+        run: python scripts/check_native_exports.py prebuilt/windows/${{ matrix.arch }}/libtorrent_flutter.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-lib-${{ matrix.arch }}
+          path: prebuilt/windows/${{ matrix.arch }}/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # ANDROID BUILD (already static)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  build-android:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28c
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+
+      - name: Download Boost headers
+        run: |
+          wget -q https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz
+          tar xf boost_1_84_0.tar.gz
+          echo "BOOST_ROOT=$PWD/boost_1_84_0" >> $GITHUB_ENV
+
+      - name: Cross-compile OpenSSL for Android
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          # Map ABI to OpenSSL target
+          case "${{ matrix.abi }}" in
+            arm64-v8a)   OSSL_TARGET="android-arm64" ;;
+            armeabi-v7a) OSSL_TARGET="android-arm" ;;
+            x86_64)      OSSL_TARGET="android-x86_64" ;;
+          esac
+
+          git clone --depth 1 --branch openssl-3.2.1 https://github.com/openssl/openssl.git openssl-src
+          cd openssl-src
+          export ANDROID_NDK_ROOT=$NDK
+          export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+
+          # armeabi-v7a: OpenSSL's 32-bit ARM assembly uses R_ARM_REL32 relocations
+          # against OPENSSL_armcap_P which can't be made PIC. Use no-asm for 32-bit.
+          EXTRA_OPTS=""
+          if [ "${{ matrix.abi }}" = "armeabi-v7a" ]; then
+            EXTRA_OPTS="no-asm"
+          fi
+
+          ./Configure $OSSL_TARGET -D__ANDROID_API__=24 \
+            --prefix=$PWD/../openssl-install \
+            -fPIC \
+            no-shared no-tests no-ui-console no-docs $EXTRA_OPTS
+          make -j$(nproc)
+          make install_sw
+          cd ..
+          echo "OPENSSL_ROOT=$PWD/openssl-install" >> $GITHUB_ENV
+          echo "=== OpenSSL installed ==="
+          ls -la openssl-install/lib*/
+        timeout-minutes: 15
+
+      - name: Build libtorrent for Android (with encryption)
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          git clone --depth 1 --recurse-submodules --branch v${LIBTORRENT_VERSION} https://github.com/arvidn/libtorrent.git libtorrent-src
+          cd libtorrent-src
+
+          # Detect OpenSSL lib directory (lib or lib64 depending on ABI)
+          if [ -d "$OPENSSL_ROOT/lib64" ]; then
+            OSSL_LIB_DIR="$OPENSSL_ROOT/lib64"
+          else
+            OSSL_LIB_DIR="$OPENSSL_ROOT/lib"
+          fi
+
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_ANDROID_NDK=$NDK \
+            -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }} \
+            -DCMAKE_ANDROID_STL_TYPE=c++_static \
+            -DCMAKE_SYSTEM_VERSION=24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -Dstatic_runtime=ON \
+            -Ddeprecated-functions=ON -Dwebtorrent=OFF \
+            -Dencryption=ON \
+            -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT \
+            -DOPENSSL_INCLUDE_DIR=$OPENSSL_ROOT/include \
+            -DOPENSSL_CRYPTO_LIBRARY=$OSSL_LIB_DIR/libcrypto.a \
+            -DOPENSSL_SSL_LIBRARY=$OSSL_LIB_DIR/libssl.a \
+            -DBOOST_ROOT=$BOOST_ROOT \
+            -DBoost_INCLUDE_DIR=$BOOST_ROOT \
+            -G Ninja \
+            -Wno-dev
+          ninja -j$(nproc)
+          echo "=== Built ==="
+          find . -name "*.a" | head -5
+        timeout-minutes: 30
+
+      - name: Build torrent_bridge for Android
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cmake --install libtorrent-src/build --prefix "$PWD/lt-install"
+          OSSL_LIB_DIR="$OPENSSL_ROOT/lib"
+          if [ -d "$OPENSSL_ROOT/lib64" ]; then OSSL_LIB_DIR="$OPENSSL_ROOT/lib64"; fi
+          cmake -S src -B build-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_static \
+            -DCMAKE_PREFIX_PATH="$PWD/lt-install" -DBOOST_ROOT="$BOOST_ROOT" -DBoost_INCLUDE_DIR="$BOOST_ROOT" \
+            -DOPENSSL_INCLUDE_DIR="$OPENSSL_ROOT/include" \
+            -DOPENSSL_SSL_LIBRARY="$OSSL_LIB_DIR/libssl.a" -DOPENSSL_CRYPTO_LIBRARY="$OSSL_LIB_DIR/libcrypto.a"
+          cmake --build build-bridge --parallel 2
+
+      - name: Copy to prebuilt
+        run: |
+          mkdir -p prebuilt/android/${{ matrix.abi }}
+          cp build-bridge/liblibtorrent_flutter.so prebuilt/android/${{ matrix.abi }}/
+          ls -la prebuilt/android/${{ matrix.abi }}/
+
+      - name: Verify Android exports and 16 KB alignment
+        run: |
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          SO="prebuilt/android/${{ matrix.abi }}/liblibtorrent_flutter.so"
+          python3 scripts/check_native_exports.py "$SO" --nm "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -lW "$SO" > elf-headers.txt
+          python3 scripts/check_android_alignment.py elf-headers.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-native-lib-${{ matrix.abi }}
+          path: prebuilt/android/${{ matrix.abi }}/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # iOS BUILD (static library, arm64 + x86_64 simulator)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  build-ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake ninja
+      - name: Build device and simulator XCFramework
+        run: bash scripts/build_apple.sh ios
+        timeout-minutes: 90
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Verify Flutter device and simulator linkage
+        run: |
+          python3 scripts/prepare_example.py ios
+          cd example
+          flutter pub get
+          flutter build ios --no-codesign
+          flutter build ios --simulator
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-native-lib
+          path: prebuilt/ios/libtorrent_flutter.xcframework/
+          if-no-files-found: error
+          retention-days: 14
