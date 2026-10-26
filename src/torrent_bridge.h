@@ -164,7 +164,16 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                                          lt_torrent_id torrent_id,
                                          int file_index,
                                          int64_t max_cache_bytes);
+/* Stop all streams and clear downloaded data before opening the selected file.
+ * Retains the torrent ID and metadata. file_index must be explicit (>= 0).
+ * Returns the new stream ID, or -1 with lt_last_error() on failure. */
+TORRENT_API lt_stream_id lt_switch_file(lt_session_t session,
+                                        lt_torrent_id torrent_id,
+                                        int file_index,
+                                        int64_t max_cache_bytes);
 TORRENT_API void         lt_stop_stream(lt_session_t session, lt_stream_id id);
+/* keep_torrent=0 removes the torrent/files only when its last stream stops. */
+TORRENT_API void         lt_stop_stream_ex(lt_session_t session, lt_stream_id id, int keep_torrent);
 TORRENT_API int          lt_get_stream_status(lt_session_t session,
                                               lt_stream_id id,
                                               lt_stream_status* out);

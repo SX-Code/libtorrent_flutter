@@ -2,6 +2,13 @@
 
 ## 2.0.1-dev.1 (unreleased)
 
+- Add `stopStream(..., keepTorrent: false)` and the same option to `stopAllStreamsForTorrent`. The last stream deletes its task/files by default in both modes.
+- **Explicit episode policy:** `streamOnly=true` controls on-demand downloading; `switchFile` controls replacement and cleanup. Use `startStream` to open the first stream and `switchFile` to explicitly stop old streams, wait for payload/partfile deletion, and start with fresh owned-piece state under the same torrent ID and metadata. `startStream` allows different files to stream concurrently in both modes; it never implicitly switches or cleans up, so downloaded data may accumulate. Stopping the last stream with `keepTorrent: true` keeps metadata only. BT peers reconnect when changing episodes.
+- **Ordinary download compatibility:** `streamOnly=false` callers must explicitly pass `keepTorrent: true` to retain downloaded data after stopping. The example's Stop Stream action has been updated. Retention no longer restores all-file downloading.
+- Merge per-stream priorities/deadlines and fan out piece alerts for simultaneous streams of the same or different files in both download modes. Serialize lifecycle operations; direct `removeTorrent` stops all associated streams without recursive deletion.
+- Propagate episode-cleanup failures to Dart, preserve metadata for retry, and remove stopped stream URLs from Dart immediately after explicit switching.
+- Require rebuilt native artifacts exporting `lt_stop_stream_ex` and `lt_switch_file`; the legacy native stop entry point uses the default delete policy.
+
 - Port bounded piece caches and sliding stream windows from fork commits `586a129` and `88eb0ab`, retaining owned buffers and 2.0.0 Android/Range fixes.
 - Restore file sizes in the FFI file list and verify existing local files when no resume state is supplied.
 - Serialize cache eviction and metadata/startup priority changes; keep idle seeds connected for streaming.

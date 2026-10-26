@@ -605,7 +605,7 @@ class _TorrentCard extends StatelessWidget {
             ),
             FilledButton(
               onPressed: () {
-                engine.stopStream(initialStream.id);
+                engine.stopStream(initialStream.id, keepTorrent: true);
                 Navigator.pop(ctx);
               },
               child: const Text('Stop Stream'),

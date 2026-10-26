@@ -149,12 +149,77 @@ final bool active = engine.isStreaming(id);
 // Get info for a specific stream
 final StreamInfo? info = engine.getStreamInfo(streamId);
 
-// Stop a specific stream
-engine.stopStream(streamId);
+// Stop a stream; the last stream removes its torrent and downloaded files.
+engine.stopStream(streamId); // keepTorrent defaults to false
 
-// Stop all streams for a torrent
-engine.stopAllStreamsForTorrent(torrentId);
+// Keep the torrent ID and metadata; streamOnly tasks clear stopped-episode data.
+engine.stopStream(streamId, keepTorrent: true);
+
+// Stop all streams, optionally retaining the torrent.
+engine.stopAllStreamsForTorrent(torrentId, keepTorrent: true);
 ```
+
+### Episode switching and upload
+
+`streamOnly` is the third positional argument. Set it to `true` for on-demand
+downloading. Use `switchFile` for episode changes to retain only the new episode's
+data. Verified pieces can upload while playing, including after download completes.
+
+```dart
+final torrentId = engine.addMagnet(magnetUri, null, true);
+// Wait for metadata, then select a file from engine.getFiles(torrentId).
+final first = engine.startStream(torrentId, fileIndex: firstFileIndex);
+// Play first.url. When switching, release the old player first.
+final next = engine.switchFile(torrentId, fileIndex: nextFileIndex);
+// switchFile stops the old episode and clears its disk data; no stopStream needed.
+// Play next.url. On final exit, release the player and clean up:
+engine.removeTorrent(torrentId, deleteFiles: true);
+```
+
+`startStream` only opens a stream; it never deletes data or stops other streams.
+It allows different files to stream simultaneously in both download modes. Their
+downloaded data is retained and may accumulate. Use `switchFile` for episode
+changes when old streams and data should be cleared.
+
+`switchFile` ends all streams of the specified torrent, deletes its downloaded data (including partial data in libtorrent's partfile),
+and resets the owned-piece state before the next episode starts. The torrent ID,
+metadata, file list and discovery settings are retained. BT connections reconnect;
+the magnet metadata does not need to be downloaded again. After a switch only the
+new stream remains. Repeated `switchFile` calls retain the current episode's data,
+not ten episodes after ten switches. Repeated `startStream` calls keep old streams
+and data instead. BT pieces can straddle file boundaries, so a small amount of adjacent
+file data may be needed to verify the current episode's boundary pieces; it is
+cleared on the next switch too. This is separate from `maxCacheBytes`, which
+limits the RAM cache.
+
+You can also stop before choosing the next episode:
+
+```dart
+engine.stopStream(currentStream.id, keepTorrent: true);
+// The last stream's data is cleared; only paused metadata/ID remain.
+final next = engine.startStream(torrentId, fileIndex: nextFileIndex);
+```
+
+Cleanup waits for libtorrent's disk-deletion completion before starting new disk
+writes. If deletion fails or exceeds 30 seconds, playback does not start and the
+call throws; fix the storage problem and retry `switchFile` with the same ID.
+`switchFile` requires an explicit, nonnegative file index and validates it before
+stopping the old episode. Even switching to the same file clears downloaded data
+and starts a fresh stream. It can also be used for ordinary download torrents;
+that explicit call replaces all streams and clears the torrent's downloaded data.
+`removeTorrent` remains the final cleanup path and stops all associated streams.
+Release player objects separately. Final removal uses libtorrent's asynchronous
+deletion; episode switching waits for deletion to finish.
+
+**Compatibility:** `keepTorrent` defaults to `false`; stopping the last stream
+removes the entire task/files in both modes. With `streamOnly=false`, explicit
+`keepTorrent: true` retains downloaded data and supports different simultaneous
+files. With `streamOnly=true`, it now retains metadata only after the last stream
+stops; use `switchFile` for bounded episode storage. Retention does not enable all-file
+background downloading. Rebuild native libraries with this Dart package: the FFI
+entry points are `lt_stop_stream_ex` and `lt_switch_file`; older binaries do not
+implement this behavior. Callers of the earlier automatic-switching implementation
+must replace episode-changing `startStream` calls with `switchFile`.
 
 ### Cleanup
 

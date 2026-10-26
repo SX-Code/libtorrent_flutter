@@ -266,7 +266,10 @@ class LibtorrentFlutter {
   /// Add a torrent from a magnet URI.
   ///
   /// Returns the torrent ID. [savePath] defaults to the path set in init().
-  /// Set [streamOnly] to true to prevent background downloading.
+  /// Set [streamOnly] to true to download only pieces requested by streams.
+  /// Multiple files can stream concurrently. Use [switchFile] when changing
+  /// episodes to clear old disk data while retaining the torrent ID/metadata.
+  /// Stopping the last stream with keepTorrent: true retains metadata only.
   int addMagnet(String magnetUri, [String? savePath, bool streamOnly = false]) {
     final enhanced = TrackerManager.injectTrackers(magnetUri);
     final m = enhanced.toNativeUtf8();
@@ -299,9 +302,12 @@ class LibtorrentFlutter {
     }
   }
 
-  /// Remove a torrent. Optionally delete downloaded files.
+  /// Stop all associated streams and remove the torrent.
+  /// Optionally delete downloaded files. Safe to call repeatedly.
   void removeTorrent(int id, {bool deleteFiles = false}) {
     _b.removeTorrent(_session, id, deleteFiles ? 1 : 0);
+    _streams.removeWhere((_, stream) => stream.torrentId == id);
+    _streamsCtrl.add(Map.unmodifiable(_streams));
     _torrents.remove(id);
     _torrentsCtrl.add(Map.unmodifiable(_torrents));
   }
@@ -331,7 +337,11 @@ class LibtorrentFlutter {
   }
 
   /// Set download priorities per file (0 = skip, 1-7 = priority levels).
+  /// Stop associated streams with keepTorrent: true before changing selection.
   void setFilePriorities(int torrentId, List<int> priorities) {
+    if (_streams.values.any((stream) => stream.torrentId == torrentId)) {
+      throw StateError('Stop active streams before changing file priorities');
+    }
     final count = priorities.length;
     final buf = calloc<Int32>(count);
     try {
@@ -351,6 +361,10 @@ class LibtorrentFlutter {
   /// Returns [StreamInfo] with an HTTP URL that can be passed to any video player.
   /// [fileIndex] = -1 auto-selects the largest streamable file.
   /// [maxCacheBytes] controls how much RAM the piece cache uses (0 = default ~128MB).
+  /// Opens a stream without stopping existing streams or deleting data.
+  /// Different files may stream concurrently, including in streamOnly mode.
+  /// Their downloaded data is retained and may accumulate; use [switchFile]
+  /// to replace old streams and clear data when changing episodes.
   StreamInfo startStream(
     int torrentId, {
     int fileIndex = -1,
@@ -362,8 +376,35 @@ class LibtorrentFlutter {
       fileIndex,
       maxCacheBytes,
     );
-    if (streamId < 0) {
-      throw Exception('startStream failed: ${_b.lastError().toDartString()}');
+    return _registerStream(torrentId, streamId, 'startStream');
+  }
+
+  /// Stop this torrent's streams, delete downloaded data, and open [fileIndex].
+  /// Keeps the torrent ID and metadata. Release the old player before calling;
+  /// no separate [stopStream] call is needed. The returned URL/ID replace the old
+  /// ones. File validation happens before cleanup, and cleanup failures throw.
+  /// [fileIndex] must be explicit (>= 0); even reselecting the same file resets
+  /// its downloaded data. Can also retry a previously failed episode cleanup.
+  StreamInfo switchFile(
+    int torrentId, {
+    required int fileIndex,
+    int maxCacheBytes = 0,
+  }) {
+    final streamId = _b.switchFile(
+      _session,
+      torrentId,
+      fileIndex,
+      maxCacheBytes,
+    );
+    return _registerStream(torrentId, streamId, 'switchFile');
+  }
+
+  StreamInfo _registerStream(int torrentId, int streamId, String operation) {
+    final error = streamId < 0 ? _b.lastError().toDartString() : null;
+    _removeStoppedStreams(torrentId);
+    if (error != null) {
+      _pollTorrents();
+      throw Exception('$operation failed: $error');
     }
     final statusBuf = calloc<LtStreamStatus>();
     try {
@@ -378,21 +419,52 @@ class LibtorrentFlutter {
     }
   }
 
-  /// Stop a stream.
-  void stopStream(int streamId) {
-    _b.stopStream(_session, streamId);
+  /// Stop a stream. By default the last stream also removes its torrent
+  /// and deletes downloaded files, regardless of the streamOnly setting.
+  /// With [keepTorrent], streamOnly torrents retain metadata/ID but clear
+  /// disk data when their last stream stops. Ordinary torrents also retain data.
+  /// Other active streams of this torrent keep their task/data alive.
+  void stopStream(int streamId, {bool keepTorrent = false}) {
+    _b.stopStream(_session, streamId, keepTorrent ? 1 : 0);
+    final error = _b.lastError().toDartString();
     _streams.remove(streamId);
     _streamsCtrl.add(Map.unmodifiable(_streams));
+    // Reflect deletion or metadata-only retention immediately.
+    _pollTorrents();
+    if (error.isNotEmpty) throw Exception('stopStream failed: $error');
   }
 
-  /// Stop all streams for a specific torrent.
-  void stopAllStreamsForTorrent(int torrentId) {
+  // An episode switch may stop multiple native streams before returning,
+  // including when cleanup fails. Do not leave their URLs visible in Dart.
+  void _removeStoppedStreams(int torrentId) {
+    final ids = _streams.values
+        .where((stream) => stream.torrentId == torrentId)
+        .map((stream) => stream.id)
+        .toList();
+    if (ids.isEmpty) return;
+    final status = calloc<LtStreamStatus>();
+    var changed = false;
+    try {
+      for (final id in ids) {
+        if (_b.getStreamStatus(_session, id, status) == 0) {
+          _streams.remove(id);
+          changed = true;
+        }
+      }
+    } finally {
+      calloc.free(status);
+    }
+    if (changed) _streamsCtrl.add(Map.unmodifiable(_streams));
+  }
+
+  /// Stop all streams for a specific torrent, optionally retaining the task.
+  void stopAllStreamsForTorrent(int torrentId, {bool keepTorrent = false}) {
     final toStop = _streams.entries
         .where((e) => e.value.torrentId == torrentId)
         .map((e) => e.key)
         .toList();
     for (final sid in toStop) {
-      stopStream(sid);
+      stopStream(sid, keepTorrent: keepTorrent);
     }
   }
 
@@ -613,31 +685,23 @@ class LibtorrentFlutter {
   /// Returns true if the torrent existed and was removed, false if it was
   /// already gone.
   bool disposeTorrent(int torrentId) {
-    if (!_torrents.containsKey(torrentId)) return false;
-
-    // Stop any active streams for this torrent
-    stopAllStreamsForTorrent(torrentId);
-
-    // Remove the torrent and delete its files
-    removeTorrent(torrentId, deleteFiles: true);
-    return true;
+    // A torrent may have been added before the first status poll.
+    final status = calloc<LtTorrentStatus>();
+    try {
+      final existed = _b.getStatus(_session, torrentId, status) != 0;
+      removeTorrent(torrentId, deleteFiles: true);
+      return existed;
+    } finally {
+      calloc.free(status);
+    }
   }
 
   /// Clean up ALL torrents: stops every stream, removes every torrent,
   /// deletes all downloaded files. Call this on your exit button.
   void disposeAll() {
-    // Stop all streams first
-    for (final sid in _streams.keys.toList()) {
-      try {
-        stopStream(sid);
-      } catch (_) {}
-    }
-
-    // Remove all torrents and delete their files
+    _pollTorrents();
     for (final tid in _torrents.keys.toList()) {
-      try {
-        removeTorrent(tid, deleteFiles: true);
-      } catch (_) {}
+      removeTorrent(tid, deleteFiles: true);
     }
   }
 
