@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # download_prebuilt.sh — Download prebuilt native libraries from a GitHub Release
-# Usage: LIBTORRENT_FLUTTER_RELEASE_BASE_URL=<release-directory-url> bash scripts/download_prebuilt.sh
+# Usage: bash scripts/download_prebuilt.sh
+# Optional override: LIBTORRENT_FLUTTER_RELEASE_BASE_URL=<release-directory-url>
 set -euo pipefail
 
-BASE_URL="${LIBTORRENT_FLUTTER_RELEASE_BASE_URL:?Set to the matching release directory, e.g. https://github.com/OWNER/REPO/releases/download/v2.0.1-dev.1}"
 cd "$(dirname "$0")/.."
+PLUGIN_VERSION="$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' pubspec.yaml)"
+if [ -z "$PLUGIN_VERSION" ]; then
+  echo "Cannot read plugin version from pubspec.yaml" >&2
+  exit 1
+fi
+BASE_URL="${LIBTORRENT_FLUTTER_RELEASE_BASE_URL:-https://github.com/SX-Code/libtorrent_flutter/releases/download/v${PLUGIN_VERSION}}"
 DOWNLOAD_DIR="$(mktemp -d)"
 trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 

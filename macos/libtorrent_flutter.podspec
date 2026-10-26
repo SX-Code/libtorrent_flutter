@@ -5,7 +5,7 @@ Pod::Spec.new do |s|
   s.description      = <<-DESC
   Native libtorrent 2.1.1 bindings for Flutter with an integrated HTTP streaming server.
                        DESC
-  s.homepage         = 'https://github.com/ayman708-UX/libtorrent_flutter'
+  s.homepage         = 'https://github.com/SX-Code/libtorrent_flutter'
   s.license          = { :type => 'GPL-3.0', :file => '../LICENSE' }
   s.author           = { 'ayman708-UX' => 'ayman@example.com' }
   s.source           = { :path => '.' }
@@ -24,13 +24,15 @@ Pod::Spec.new do |s|
   # matching GitHub Release on first `pod install`. Set the env var
   # LIBTORRENT_FLUTTER_SKIP_DOWNLOAD=1 to opt out.
   # ───────────────────────────────────────────────────────────────────────
-  if !File.exist?(prebuilt_absolute) && ENV['LIBTORRENT_FLUTTER_SKIP_DOWNLOAD'] != '1' && ENV['LIBTORRENT_FLUTTER_RELEASE_BASE_URL']
+  if !File.exist?(prebuilt_absolute) && ENV['LIBTORRENT_FLUTTER_SKIP_DOWNLOAD'] != '1'
     pubspec_path = File.expand_path(File.join(__dir__, '..', 'pubspec.yaml'))
     if File.exist?(pubspec_path)
       version_match = File.read(pubspec_path).match(/^version:\s*(\S+)/)
       if version_match
         plugin_version = version_match[1]
-        zip_url  = "#{ENV['LIBTORRENT_FLUTTER_RELEASE_BASE_URL']}/macos-native-lib.zip"
+        release_base = ENV['LIBTORRENT_FLUTTER_RELEASE_BASE_URL'].to_s.strip
+        release_base = "https://github.com/SX-Code/libtorrent_flutter/releases/download/v#{plugin_version}" if release_base.empty?
+        zip_url  = "#{release_base}/macos-native-lib.zip"
         zip_path = File.join(__dir__, '.macos-native-lib.zip')
         Pod::UI.puts "libtorrent_flutter: downloading prebuilt dylib from #{zip_url}"
         begin

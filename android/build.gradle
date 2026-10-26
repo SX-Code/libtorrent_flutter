@@ -40,12 +40,13 @@ android {
     // dropped your own .so files into prebuilt/android/<abi>/).
     // ─────────────────────────────────────────────────────────────────────
     def prebuiltDir = file("${projectDir}/../prebuilt/android")
-    def skipDownload = (project.findProperty('libtorrentFlutterSkipDownload') ?: 'false').toString().toBoolean()
+    def skipDownload = (project.findProperty('libtorrentFlutterSkipDownload') ?: 'false').toString().toBoolean() ||
+        System.getenv('LIBTORRENT_FLUTTER_SKIP_DOWNLOAD') == '1'
     def requestedAbis = (project.findProperty('libtorrentFlutterAbis') ?: 'arm64-v8a,armeabi-v7a,x86_64')
         .toString().split(',').collect { it.trim() }.findAll { it }
 
-    def releaseBase = System.getenv('LIBTORRENT_FLUTTER_RELEASE_BASE_URL')
-    if (!skipDownload && releaseBase) {
+    def releaseBase = System.getenv('LIBTORRENT_FLUTTER_RELEASE_BASE_URL')?.trim()
+    if (!skipDownload) {
         // Resolve plugin version from pubspec.yaml (sibling of android/)
         def pubspecFile = file("${projectDir}/../pubspec.yaml")
         def pluginVersion = null
@@ -58,6 +59,7 @@ android {
         if (pluginVersion == null) {
             println "libtorrent_flutter: could not read version from pubspec.yaml; skipping prebuilt download"
         } else {
+            releaseBase = releaseBase ?: "https://github.com/SX-Code/libtorrent_flutter/releases/download/v${pluginVersion}"
             requestedAbis.each { abi ->
                 def soFile = file("${prebuiltDir}/${abi}/liblibtorrent_flutter.so")
                 if (soFile.exists()) return

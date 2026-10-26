@@ -216,15 +216,20 @@ FlutterForegroundTask.startService(
 
 Build with `.github/workflows/build.yml` or the Apple script above. Install the
 artifacts at the paths documented in [移植实施记录.md](移植实施记录.md).
-For a release you control, optionally set `LIBTORRENT_FLUTTER_RELEASE_BASE_URL`
-to its full directory URL, such as
-`https://github.com/OWNER/REPO/releases/download/v2.0.1-dev.1`.
-The Gradle, CMake, CocoaPods and download-script paths use this same variable.
+Missing native libraries are downloaded by default from
+`https://github.com/SX-Code/libtorrent_flutter/releases/download/v<pubspec-version>`.
+For the current version, publish the ZIP assets under tag `v2.0.1-dev.1`.
+To use a different release directory, set `LIBTORRENT_FLUTTER_RELEASE_BASE_URL`
+to its full URL. Gradle, CMake, CocoaPods and `scripts/download_prebuilt.sh`
+all support this override. Existing local libraries are used first by platform builds;
+the explicit download script downloads all platforms and replaces existing files.
 The artifacts must match this source revision; version naming alone does not
 validate ABI compatibility.
 
-Without a release URL, iOS/macOS/Android require locally supplied rebuilt
-artifacts. Linux and Windows can fall back to CMake using an installed
+Until the matching release is published, supply local artifacts for testing.
+Set `LIBTORRENT_FLUTTER_SKIP_DOWNLOAD=1` to disable automatic downloads.
+iOS/macOS/Android fail if required artifacts are missing. Linux and Windows
+can fall back to CMake using an installed
 libtorrent 2.1.1 configured with `deprecated-functions=ON` and `webtorrent=OFF`.
 An offline build also requires Flutter packages and native dependencies to have
 been downloaded beforehand.
