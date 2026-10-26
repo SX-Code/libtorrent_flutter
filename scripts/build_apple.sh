@@ -50,6 +50,7 @@ build_slice() {
     -DCMAKE_OSX_ARCHITECTURES="$arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$minimum" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_INSTALL_PREFIX="$WORK/lt-install-$key" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
     -DBUILD_SHARED_LIBS=OFF -Ddeprecated-functions=ON -Dwebtorrent=OFF -Dencryption=ON \
     -DBOOST_ROOT="$BOOST_ROOT" -DBoost_INCLUDE_DIR="$BOOST_ROOT" \
     -DOPENSSL_ROOT_DIR="$ssl_root" -DOPENSSL_INCLUDE_DIR="$ssl_root/include" \
@@ -64,10 +65,12 @@ build_slice() {
     static_bridge=OFF
     if [[ "$arch" == "$(uname -m)" ]]; then native_tests=ON; fi
   fi
+  # iOS SDK search roots can hide the prefix; locate this slice's exported target explicitly.
   cmake -S "$ROOT/src" -B "$slice" -G Ninja \
     -DCMAKE_SYSTEM_NAME="$system" -DCMAKE_OSX_SYSROOT="$sdk" \
     -DCMAKE_OSX_ARCHITECTURES="$arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$minimum" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$WORK/lt-install-$key" \
+    -DLibtorrentRasterbar_DIR="$WORK/lt-install-$key/lib/cmake/LibtorrentRasterbar" \
     -DBOOST_ROOT="$BOOST_ROOT" -DBoost_INCLUDE_DIR="$BOOST_ROOT" \
     -DOPENSSL_INCLUDE_DIR="$ssl_root/include" -DOPENSSL_SSL_LIBRARY="$ssl_root/lib/libssl.a" \
     -DOPENSSL_CRYPTO_LIBRARY="$ssl_root/lib/libcrypto.a" \

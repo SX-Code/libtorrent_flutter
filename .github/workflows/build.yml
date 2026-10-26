@@ -15,10 +15,13 @@ env:
   LIBTORRENT_FLUTTER_SKIP_DOWNLOAD: "1"
 
 jobs:
+  # Add [ios-only] to the pushed head commit message to skip non-iOS jobs for that push.
+  # Pushes without the marker, pull requests, and manual runs still build all platforms.
   # ═══════════════════════════════════════════════════════════════════════════════
   # LINUX BUILD (static libtorrent, x64 + arm64)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-linux:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[ios-only]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +33,7 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -95,7 +98,7 @@ jobs:
         run: python3 scripts/check_native_exports.py prebuilt/linux/${{ matrix.arch }}/liblibtorrent_flutter.so
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-native-lib-${{ matrix.arch }}
           path: prebuilt/linux/${{ matrix.arch }}/
@@ -111,9 +114,10 @@ jobs:
   # (headers-only as far as libtorrent's compile is concerned).
   # ═══════════════════════════════════════════════════════════════════════════════
   build-macos:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[ios-only]') }}
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: brew install cmake ninja
       - name: Build universal dylib and run native regression tests
         run: bash scripts/build_apple.sh macos
@@ -127,7 +131,7 @@ jobs:
           cd example
           flutter pub get
           flutter test integration_test/ -d macos --timeout 120s
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: macos-native-lib
           path: prebuilt/macos/
@@ -135,6 +139,7 @@ jobs:
           retention-days: 14
 
   build-windows:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[ios-only]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -147,7 +152,7 @@ jobs:
             cmake_arch: ARM64
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup vcpkg
         run: |
@@ -232,7 +237,7 @@ jobs:
         run: python scripts/check_native_exports.py prebuilt/windows/${{ matrix.arch }}/libtorrent_flutter.dll
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-native-lib-${{ matrix.arch }}
           path: prebuilt/windows/${{ matrix.arch }}/
@@ -243,13 +248,14 @@ jobs:
   # ANDROID BUILD (already static)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-android:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[ios-only]') }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         abi: [arm64-v8a, armeabi-v7a, x86_64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
@@ -374,7 +380,7 @@ jobs:
           python3 scripts/check_android_alignment.py elf-headers.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: android-native-lib-${{ matrix.abi }}
           path: prebuilt/android/${{ matrix.abi }}/
@@ -387,7 +393,7 @@ jobs:
   build-ios:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: brew install cmake ninja
       - name: Build device and simulator XCFramework
         run: bash scripts/build_apple.sh ios
@@ -402,7 +408,7 @@ jobs:
           flutter pub get
           flutter build ios --no-codesign
           flutter build ios --simulator
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ios-native-lib
           path: prebuilt/ios/libtorrent_flutter.xcframework/
