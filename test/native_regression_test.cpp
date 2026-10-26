@@ -62,16 +62,6 @@ static void test_cache() {
 }
 
 static void test_window_and_range() {
-    StreamEngine stream;
-    init_test_stream(stream, 512 * 1024, 1024);
-    stream.extend_window(20, 0);
-    require(stream.window_lo == 21 && stream.priority_hi > 21, "window did not advance");
-    stream.seek_generation = 1;
-    stream.drop_window(500);
-    stream.extend_window(30, 0);
-    require(stream.window_gen == -1, "old HTTP worker reinstalls stale download window");
-    stream.extend_window(500, 1);
-    require(stream.window_gen == 1 && stream.window_lo == 501, "new seek window not installed");
     auto suffix = std::string("GET / HTTP/1.1\r\nRange: bytes=-500\r\n\r\n");
     auto range = parse_range(suffix.data(), int(suffix.size()));
     require(range.valid && range.is_suffix && range.end == 500, "suffix Range regression");
@@ -127,6 +117,149 @@ static void wait_until(const std::function<bool()>& ready, const char* message) 
     require(false, message);
 }
 
+// Keep an HTTP request open while driving piece arrival and other connections.
+class PendingHttp {
+public:
+    socket_t socket = SOCKET_INVALID;
+    std::string headers;
+
+    PendingHttp(int port, const std::string& range) {
+        socket = ::socket(AF_INET, SOCK_STREAM, 0);
+        require(socket != SOCKET_INVALID, "pending socket creation failed");
+        try {
+#ifdef _WIN32
+            DWORD timeout = 5000;
+#else
+            timeval timeout{5, 0};
+#endif
+            setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons((uint16_t)port);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            require(::connect(socket, (sockaddr*)&address, sizeof(address)) == 0, "pending connect failed");
+            const auto request = "GET /stream/test HTTP/1.1\r\nHost: localhost\r\nRange: bytes=" + range + "\r\n\r\n";
+            require(send_all(socket, request.data(), int(request.size())) > 0, "pending send failed");
+            while (headers.find("\r\n\r\n") == std::string::npos) {
+                char byte;
+                require(recv(socket, &byte, 1, 0) == 1, "pending response header missing");
+                headers += byte;
+            }
+            require(headers.find("HTTP/1.1 206") == 0, "pending Range did not return 206");
+        } catch (...) {
+            close();
+            throw;
+        }
+    }
+    PendingHttp(const PendingHttp&) = delete;
+    PendingHttp& operator=(const PendingHttp&) = delete;
+    ~PendingHttp() { close(); }
+    void close() {
+        if (socket != SOCKET_INVALID) CLOSESOCKET(socket);
+        socket = SOCKET_INVALID;
+    }
+    bool readable() const {
+        fd_set sockets;
+        FD_ZERO(&sockets);
+        FD_SET(socket, &sockets);
+        timeval timeout{0, 0};
+        return select(int(socket) + 1, &sockets, nullptr, nullptr, &timeout) > 0;
+    }
+    std::string body() {
+        std::string result;
+        char bytes[4096];
+        for (;;) {
+            int count = recv(socket, bytes, sizeof(bytes), 0);
+            require(count >= 0, "pending body timed out");
+            if (!count) return result;
+            result.append(bytes, size_t(count));
+        }
+    }
+};
+
+static void test_http_probes(lt_session_t session, const std::filesystem::path& folder) {
+    std::filesystem::create_directories(folder);
+    constexpr int piece_length = 262144;
+    constexpr int64_t file_size = 317889956;
+    constexpr int64_t probe_offset = 85783644;
+    constexpr int probe_piece = int(probe_offset / piece_length);
+    const std::string first_piece(piece_length, '\0');
+    const std::string later_piece(piece_length, 'p');
+    lt::file_storage files;
+    files.add_file("probe.mp4", file_size);
+    lt::create_torrent torrent(files, piece_length, lt::create_torrent::v1_only);
+    const int piece_count = int((file_size + piece_length - 1) / piece_length);
+    for (int piece = 0; piece < piece_count; ++piece) {
+        int length = int(std::min<int64_t>(piece_length, file_size - int64_t(piece) * piece_length));
+        lt::hasher hash(piece == 0 ? first_piece.data() : later_piece.data(), length);
+        torrent.set_hash(lt::piece_index_t(piece), hash.final());
+    }
+    std::vector<char> encoded;
+    lt::bencode(std::back_inserter(encoded), torrent.generate());
+    auto torrent_path = folder / "probe.torrent";
+    std::ofstream(torrent_path, std::ios::binary).write(encoded.data(), encoded.size());
+    auto* sw = to_sw(session);
+    auto id = lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 1);
+    require(id >= 0, "probe fixture rejected");
+    auto sid = lt_start_stream(session, id, 0, 1024 * 1024);
+    require(sid >= 0, "probe stream failed");
+    auto* stream = sw->streams.at(sid).get();
+    auto handle = stream->handle;
+    auto scheduler = stream->scheduler;
+    handle.add_piece(lt::piece_index_t(0), first_piece.data());
+    wait_until([&] { return handle.have_piece(lt::piece_index_t(0)); }, "probe header piece missing");
+    auto head_reply = http_request(stream->server_port, "GET", "0-262143");
+    require(head_reply.substr(head_reply.find("\r\n\r\n") + 4) == first_piece, "header probe failed");
+    wait_until([&] {
+        std::lock_guard<std::mutex> lock(stream->http_mu);
+        return stream->http_readers.empty();
+    }, "header reader did not close");
+    const auto original_state = stream->stream_state.load();
+    const auto original_position = stream->read_head.load();
+    require(original_position == 262144 && original_state == LT_STREAM_READY, "header status incorrect");
+    const auto probe_range = std::to_string(probe_offset) + "-" + std::to_string(probe_offset + 499);
+    auto head = http_request(stream->server_port, "HEAD", probe_range);
+    require(head.size() == head.find("\r\n\r\n") + 4, "probe HEAD returned data");
+    require(stream->read_head == original_position && stream->stream_state == original_state,
+            "HEAD changed playback state");
+    require(scheduler->demand(probe_piece).priority == 0, "HEAD scheduled missing data");
+
+    PendingHttp high(stream->server_port, probe_range);
+    wait_until([&] { return scheduler->demand(probe_piece).priority == 7; }, "high probe not scheduled");
+    const auto high_deadline = scheduler->demand(probe_piece).deadline;
+    require(stream->read_head == probe_offset && stream->stream_state == LT_STREAM_BUFFERING,
+            "pending probe status incorrect");
+    PendingHttp shared(stream->server_port, probe_range);
+    PendingHttp disposable(stream->server_port, std::to_string(probe_offset) + "-" +
+                           std::to_string(probe_offset + piece_length));
+    wait_until([&] { return scheduler->demand(probe_piece + 1).priority > 0; }, "exclusive probe not scheduled");
+    disposable.close();
+    wait_until([&] { return scheduler->demand(probe_piece + 1).priority == 0; }, "disconnect retained exclusive demand");
+    require(scheduler->demand(probe_piece).deadline == high_deadline, "disconnect removed shared deadline");
+    for (int retry = 0; retry < 3; ++retry) {
+        auto low = http_request(stream->server_port, "GET", "0-262143");
+        require(low.substr(low.find("\r\n\r\n") + 4) == first_piece, "low probe interrupted");
+        http_request(stream->server_port, "HEAD", "0-499");
+        require(stream->read_head == probe_offset && stream->stream_state == LT_STREAM_BUFFERING,
+                "secondary GET/HEAD overwrote active reader state");
+        require(scheduler->demand(probe_piece).deadline == high_deadline, "low probe cancelled high deadline");
+        require(!high.readable() && !shared.readable(), "low probe closed a pending high response");
+    }
+    handle.add_piece(lt::piece_index_t(probe_piece), later_piece.data());
+    require(high.body() == later_piece.substr(0, 500), "high probe failed after piece arrival");
+    require(shared.body() == later_piece.substr(0, 500), "overlapping probe lost shared piece data");
+    wait_until([&] { return scheduler->demand(probe_piece).priority == 0; }, "completed probe retained demands");
+    require(handle.have_piece(lt::piece_index_t(probe_piece)), "completion discarded verified piece");
+
+    // Removal must wake blocked GETs without waiting for the piece timeout.
+    PendingHttp blocked(stream->server_port, std::to_string((probe_piece + 2) * piece_length) + "-");
+    wait_until([&] { return scheduler->demand(probe_piece + 2).priority > 0; }, "blocked reader not scheduled");
+    lt_remove_torrent(session, id, 1);
+    require(blocked.body().empty(), "removed stream still served data");
+    require(scheduler->demand(probe_piece + 2).priority == 0, "removal left reader demand");
+    require(StreamEngine::active_streams == 0, "removal leaked HTTP workers");
+}
+
 static void require_uploadable(const lt::torrent_handle& handle, int pieces) {
     auto status = handle.status(lt::torrent_handle::query_pieces);
     require(!(status.flags & lt::torrent_flags::paused), "retained torrent paused");
@@ -180,12 +313,26 @@ static void test_stream_lifecycle(lt_session_t session, const std::filesystem::p
     require(scheduler->demand(0).deadline == first_deadline, "new stream postponed existing deadline");
     const auto next_deadline = scheduler->demand(32).deadline;
 
-    // A seek and late old-generation work must not revoke another owner.
+    // Independent HTTP readers merge overlap and withdraw only their own picks.
     auto* old_stream = sw->streams.at(old).get();
-    old_stream->seek_generation = 1;
-    old_stream->drop_window(20);
-    old_stream->request_piece(20, 0);
-    require(scheduler->demand(32).deadline == next_deadline, "seek changed another stream's deadline");
+    scheduler->retain(old, [](int piece) { return piece < 20 || piece > 23; });
+    TorrReader first_reader, probe_reader;
+    first_reader.reader_id = 100;
+    probe_reader.reader_id = 101;
+    require(old_stream->begin_http_reader(first_reader, 20 * 262144, 22 * 262144 - 1), "reader registration failed");
+    old_stream->extend_window(first_reader, 20);
+    const auto shared_deadline = scheduler->demand(21).deadline;
+    require(old_stream->begin_http_reader(probe_reader, 21 * 262144, 23 * 262144 - 1), "probe registration failed");
+    old_stream->extend_window(probe_reader, 21);
+    require(scheduler->demand(21).deadline <= shared_deadline, "overlap postponed deadline");
+    require(scheduler->demand(23).priority == 0, "short probe scheduled beyond Range end");
+    old_stream->finish_http_reader(101);
+    require(scheduler->demand(21).deadline == shared_deadline, "probe stop removed shared demand");
+    require(scheduler->demand(22).priority == 0, "probe-exclusive piece survived close");
+    old_stream->extend_window(probe_reader, 22); // closed workers cannot re-register
+    require(scheduler->demand(22).priority == 0, "closed reader revived demand");
+    old_stream->finish_http_reader(100);
+    require(scheduler->demand(32).deadline == next_deadline, "probe changed another stream's deadline");
     lt_stop_stream_ex(session, old, 1);
     require(sw->active_stream_ids.at(id).count(next) == 1, "stop removed remaining owner");
     require(scheduler->demand(0).priority == 5, "shared demand not restored to remaining owner");
@@ -501,6 +648,7 @@ static void test_local_stream() {
         require(!to_sw(session)->handles.count(cleanup_id), "normal mode ignored explicit default deletion policy");
         wait_until([&] { return !fs::exists(folder / "episodes/first.mp4")
                             && !fs::exists(folder / "episodes/second.mp4"); }, "torrent files not deleted");
+        test_http_probes(session, folder / "http-probes");
         test_current_episode(session, folder / "single-episode");
         lt_destroy_session(session);
         session = nullptr;

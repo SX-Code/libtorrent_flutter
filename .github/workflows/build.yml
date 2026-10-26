@@ -15,10 +15,13 @@ env:
   LIBTORRENT_FLUTTER_SKIP_DOWNLOAD: "1"
 
 jobs:
+  # Temporarily run only iOS while debugging. Remove the four `if: ${{ false }}`
+  # guards below to restore builds for all platforms.
   # ═══════════════════════════════════════════════════════════════════════════════
   # LINUX BUILD (static libtorrent, x64 + arm64)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-linux:
+    if: ${{ false }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +114,7 @@ jobs:
   # (headers-only as far as libtorrent's compile is concerned).
   # ═══════════════════════════════════════════════════════════════════════════════
   build-macos:
+    if: ${{ false }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
@@ -135,6 +139,7 @@ jobs:
           retention-days: 14
 
   build-windows:
+    if: ${{ false }}
     strategy:
       fail-fast: false
       matrix:
@@ -243,6 +248,7 @@ jobs:
   # ANDROID BUILD (already static)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-android:
+    if: ${{ false }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false

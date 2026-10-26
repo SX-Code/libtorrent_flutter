@@ -2,6 +2,8 @@
 
 ## 2.0.1-dev.1 (unreleased)
 
+- Fix startup Range probes cancelling one another: each HTTP GET owns an independently merged download window and deadlines. Disconnects withdraw only their own demands; HEAD never changes playback state or scheduling. Range offsets no longer imply a user seek; status follows the first active GET.
+- Add opt-in HTTP Range/wait/completion diagnostics via `TB_LOG_FILE=stderr` or a writable file path. Native regression coverage includes HEAD isolation, concurrent probes, shared-piece delivery and disconnect/removal cleanup.
 - Add `stopStream(..., keepTorrent: false)` and the same option to `stopAllStreamsForTorrent`. The last stream deletes its task/files by default in both modes.
 - **Explicit episode policy:** `streamOnly=true` controls on-demand downloading; `switchFile` controls replacement and cleanup. Use `startStream` to open the first stream and `switchFile` to explicitly stop old streams, wait for payload/partfile deletion, and start with fresh owned-piece state under the same torrent ID and metadata. `startStream` allows different files to stream concurrently in both modes; it never implicitly switches or cleans up, so downloaded data may accumulate. Stopping the last stream with `keepTorrent: true` keeps metadata only. BT peers reconnect when changing episodes.
 - **Ordinary download compatibility:** `streamOnly=false` callers must explicitly pass `keepTorrent: true` to retain downloaded data after stopping. The example's Stop Stream action has been updated. Retention no longer restores all-file downloading.

@@ -136,10 +136,10 @@ print(stream.url);  // http://127.0.0.1:PORT/stream/...
 engine.streamUpdates.listen((Map<int, StreamInfo> streams) {
   for (final s in streams.values) {
     print('url: ${s.url}');
-    print('ready: ${s.isReady}');       // true = player can connect
+    print('ready: ${s.isReady}');       // HTTP reader readiness, not decoder state
     print('buffer: ${s.bufferPct}%');   // 0–100 buffered ahead
     print('fileSize: ${s.fileSize}');
-    print('readHead: ${s.readHead}');   // current byte position
+    print('readHead: ${s.readHead}');   // primary HTTP reader's byte position
   }
 });
 
@@ -158,6 +158,25 @@ engine.stopStream(streamId, keepTorrent: true);
 // Stop all streams, optionally retaining the torrent.
 engine.stopAllStreamsForTorrent(torrentId, keepTorrent: true);
 ```
+
+`readHead` follows the first active HTTP GET; when it ends, another active GET
+takes over. It is not the player's decoded playback position. MP4 metadata/index
+probes can read different offsets before the first frame. Each GET owns its own
+download window; overlapping requests share priorities and use the earliest
+deadline. Completing or disconnecting a GET withdraws only that GET's demands.
+HEAD returns headers without changing the read position, readiness or downloads.
+Range changes no longer emit `seeking`; the server cannot distinguish a container
+probe from a user seek. Use the player's events for playback and seek status.
+
+To diagnose startup stalls without changing `media_kit`, enable native HTTP logs
+before launching the app. In Xcode, open **Product → Scheme → Edit Scheme → Run →
+Arguments → Environment Variables** and set `TB_LOG_FILE=stderr`. The console will
+show stream/reader IDs, GET/HEAD, the requested Range, resolved offsets, waits for
+missing pieces and completed/interrupted responses. Alternatively, set
+`TB_LOG_FILE` to a writable absolute file path (inside the app's sandbox on iOS).
+Set it before native initialization; the setting is read once per process.
+Logging is disabled when unset. These diagnostics require rebuilding the native
+library/XCFramework from the updated source; Flutter hot reload is insufficient.
 
 ### Episode switching and upload
 

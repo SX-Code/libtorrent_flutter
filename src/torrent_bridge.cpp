@@ -62,6 +62,7 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   #include <fcntl.h>
+  #include <poll.h>
   #include <signal.h>
   typedef int socket_t;
   #define SOCKET_INVALID  (-1)
@@ -78,6 +79,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <map>
+#include <cerrno>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -97,7 +100,7 @@ namespace lt  = libtorrent;
 namespace chr = std::chrono;
 
 // ── debug logging ───────────────────────────────────────────────────────────────
-// Off unless TB_LOG_FILE names a file. It used to fopen() a hard-coded
+// Off unless TB_LOG_FILE names a file or "stderr". It used to fopen() a hard-coded
 // desktop path on every call, under a global lock, on every platform.
 static FILE* g_logfile = nullptr;
 static std::mutex g_log_mu;
@@ -106,8 +109,11 @@ static std::once_flag g_log_once;
 static bool tb_log_enabled() {
     std::call_once(g_log_once, [] {
         if (const char* path = std::getenv("TB_LOG_FILE")) {
-            g_logfile = fopen(path, "w");
-            if (g_logfile) setvbuf(g_logfile, nullptr, _IONBF, 0);
+            if (std::strcmp(path, "stderr") == 0) g_logfile = stderr;
+            else {
+                g_logfile = fopen(path, "w");
+                if (g_logfile) setvbuf(g_logfile, nullptr, _IONBF, 0);
+            }
         }
     });
     return g_logfile != nullptr;
@@ -376,6 +382,10 @@ struct CachePiece {
 // Tracks a single reader's position, readahead, and active state
 struct TorrReader {
     int     reader_id = 0;
+    int     request_first_piece = 0;
+    int     request_last_piece = 0;
+    int     priority_hi = -1;
+    int     deadline_hi = -1;
     int64_t offset = 0;          // port of Reader.offset
     int64_t readahead = 0;       // port of Reader.readahead
     bool    is_closed = false;   // port of Reader.isClosed
@@ -851,12 +861,19 @@ public:
             handle_.prioritize_pieces(priorities);
             initialized_ = true;
         }
-        demands_.emplace(id, std::unordered_map<int, PieceDemand>{});
+        demands_.emplace(std::make_pair(id, 0), std::unordered_map<int, PieceDemand>{});
     }
 
-    void request(lt_stream_id id, int piece, int priority, int deadline_ms = -1) {
+    bool add_reader(lt_stream_id id, int reader) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto owner = demands_.find(id);
+        if (!demands_.count({id, 0})) return false;
+        demands_.emplace(std::make_pair(id, reader), std::unordered_map<int, PieceDemand>{});
+        return true;
+    }
+
+    void request(lt_stream_id id, int piece, int priority, int deadline_ms = -1, int reader = 0) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto owner = demands_.find({id, reader});
         if (owner == demands_.end()) return; // stopped workers cannot re-register
         auto& demand = owner->second[piece];
         demand.priority = std::max(demand.priority, priority);
@@ -867,15 +884,15 @@ public:
         apply_locked(piece);
     }
 
-    void release(lt_stream_id id, int piece) {
+    void release(lt_stream_id id, int piece, int reader = 0) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto owner = demands_.find(id);
+        auto owner = demands_.find({id, reader});
         if (owner != demands_.end() && owner->second.erase(piece)) apply_locked(piece);
     }
 
-    void retain(lt_stream_id id, const std::function<bool(int)>& keep) {
+    void retain(lt_stream_id id, const std::function<bool(int)>& keep, int reader = 0) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto owner = demands_.find(id);
+        auto owner = demands_.find({id, reader});
         if (owner == demands_.end()) return;
         std::vector<int> removed;
         for (auto it = owner->second.begin(); it != owner->second.end();) {
@@ -886,13 +903,24 @@ public:
         for (int p : removed) apply_locked(p);
     }
 
-    void remove_stream(lt_stream_id id) {
+    void remove_reader(lt_stream_id id, int reader) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto owner = demands_.find(id);
+        auto owner = demands_.find({id, reader});
         if (owner == demands_.end()) return;
         auto removed = std::move(owner->second);
         demands_.erase(owner);
         for (const auto& entry : removed) apply_locked(entry.first);
+    }
+
+    void remove_stream(lt_stream_id id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::unordered_set<int> removed;
+        for (auto it = demands_.begin(); it != demands_.end();) {
+            if (it->first.first != id) { ++it; continue; }
+            for (const auto& entry : it->second) removed.insert(entry.first);
+            it = demands_.erase(it);
+        }
+        for (int piece : removed) apply_locked(piece);
     }
 
     bool owns(const lt::torrent_handle& handle) const { return handle_ == handle; }
@@ -969,7 +997,8 @@ private:
     std::mutex mu_;
     lt::torrent_handle handle_;
     bool initialized_ = false;
-    std::unordered_map<lt_stream_id, std::unordered_map<int, PieceDemand>> demands_;
+    // Reader 0 owns startup/preload requests. Positive IDs own HTTP GETs.
+    std::map<std::pair<lt_stream_id, int>, std::unordered_map<int, PieceDemand>> demands_;
 };
 
 struct StreamEngine {
@@ -994,7 +1023,12 @@ struct StreamEngine {
     // playback
     std::atomic<int64_t> read_head{0};
     std::atomic<int32_t> stream_state{LT_STREAM_BUFFERING};
-    std::atomic<int32_t> seek_generation{0};
+    // HTTP offsets are not user seek signals. Only one active reader supplies
+    // telemetry; independent probes must not change another reader's status.
+    struct HttpPosition { int64_t cursor; bool waiting; };
+    std::mutex http_mu;
+    std::map<int, HttpPosition> http_readers;
+    int primary_reader = -1;
 
     // readahead fixed at 16MB like TorrServer — port of torrent.go updateRA()
     static constexpr int64_t FIXED_READAHEAD = 16 * 1024 * 1024;
@@ -1043,8 +1077,6 @@ struct StreamEngine {
 
     // trailing retention — keep last N played pieces for re-reads/rewinds
     static constexpr int TRAILING_WINDOW = 3;
-    std::deque<int>  trailing_pieces;
-    std::mutex       trailing_mu;
 
     // Hot-cache bookkeeping. Every read_piece_alert copies a whole piece into
     // RAM (cache buffer + read_results). Without a hard bound, prefetched,
@@ -1136,18 +1168,8 @@ struct StreamEngine {
     float estimated_bitrate_bps = 625000.0f;
     int   critical_startup_pieces = 2;  // computed at init
 
-    // ── sliding download window ──
-    // Pieces used to be requested only when serve_range hit a missing one,
-    // so downloading stopped as soon as that batch landed and resumed only
-    // after the player had eaten through it. Peers went idle in between
-    // and high-bitrate files froze. The window now slides with the read
-    // cursor so the swarm is always working on what comes next.
-    std::mutex window_mu;
-    int window_gen = -1;
-    int window_lo = -1;      // first piece this window raised
-    int deadline_hi = -1;    // last piece given a deadline
-    int priority_hi = -1;    // last piece given a priority
-
+    // Each HTTP reader advances its own bounded window. Demand merging in
+    // StreamScheduler preserves overlapping probes and other playback streams.
     // ~60 s of video ahead of the cursor (on top of the player's buffer).
     int window_pieces() const {
         int64_t bytes = std::clamp<int64_t>((int64_t)(estimated_bitrate_bps * 60.0f),
@@ -1165,68 +1187,59 @@ struct StreamEngine {
         return std::clamp((int)(piece_length / estimated_bitrate_bps * 1000.0f), 100, 10000);
     }
 
-    // Raises what the window hasn't covered yet past [from]. Pieces keep
-    // what they were given; only new ones are touched, so this is cheap to
-    // call for every piece served.
-    void extend_window(int from, int gen) {
-        const int last_deadline = std::min(end_piece, from + deadline_pieces());
-        const int last = std::min(end_piece, from + window_pieces());
-        const int step_ms = piece_play_ms();
-        std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> prios;
-        std::vector<std::pair<int, int>> deadlines;
-        std::lock_guard<std::mutex> window_lock(window_mu);
-        if (!active.load() || seek_generation.load() != gen) return;
-        {
-            if (window_gen != gen) {
-                window_gen = gen;
-                window_lo = from + 1;
-                deadline_hi = priority_hi = from;
-            }
-            std::lock_guard<std::mutex> plk(piece_mu);
-            for (int p = std::max(from + 1, deadline_hi + 1); p <= last_deadline; ++p) {
-                if (!pieces_have.count(p)) deadlines.push_back({p, (p - from) * step_ms});
-            }
-            deadline_hi = std::max(deadline_hi, last_deadline);
-            const int span = std::max(1, last - from);
-            for (int p = std::max(from + 1, priority_hi + 1); p <= last; ++p) {
-                if (pieces_have.count(p)) continue;
-                // 7 near the cursor falling to 1 at the far end
-                int pri = 7 - (6 * (p - from)) / span;
-                prios.push_back({lt::piece_index_t(p), lt::download_priority_t(std::max(1, pri))});
-            }
-            priority_hi = std::max(priority_hi, last);
+    bool begin_http_reader(TorrReader& reader, int64_t first, int64_t last) {
+        std::lock_guard<std::mutex> lock(http_mu);
+        if (!active.load() || (scheduler && !scheduler->add_reader(id, reader.reader_id))) return false;
+        reader.request_first_piece = byte_to_piece(first);
+        reader.request_last_piece = byte_to_piece(last);
+        reader.priority_hi = reader.deadline_hi = reader.request_first_piece - 1;
+        http_readers.emplace(reader.reader_id, HttpPosition{first, true});
+        if (primary_reader < 0) primary_reader = reader.reader_id;
+        publish_http_position();
+        return true;
+    }
+
+    // Caller holds http_mu. This is network read progress, not decoded playback.
+    void publish_http_position() {
+        auto current = http_readers.find(primary_reader);
+        if (current == http_readers.end()) return;
+        read_head.store(current->second.cursor);
+        stream_state.store(current->second.waiting ? LT_STREAM_BUFFERING : LT_STREAM_READY);
+    }
+
+    void update_http_reader(int reader, int64_t cursor, bool waiting) {
+        std::lock_guard<std::mutex> lock(http_mu);
+        auto current = http_readers.find(reader);
+        if (current == http_readers.end()) return;
+        current->second = {cursor, waiting};
+        if (primary_reader == reader) publish_http_position();
+    }
+
+    void finish_http_reader(int reader) {
+        std::lock_guard<std::mutex> lock(http_mu);
+        if (scheduler) scheduler->remove_reader(id, reader);
+        http_readers.erase(reader);
+        if (primary_reader == reader) {
+            primary_reader = http_readers.empty() ? -1 : http_readers.begin()->first;
+            publish_http_position();
         }
-        if (scheduler) {
-            for (const auto& entry : prios)
-                scheduler->request(id, int(entry.first), static_cast<std::uint8_t>(entry.second));
-            for (const auto& entry : deadlines)
-                scheduler->request(id, entry.first, 7, entry.second);
-        }
     }
 
-    // Only this stream's obsolete window is withdrawn. Other streams retain
-    // their deadlines, including when they overlap this stream's old window.
-    void drop_window(int new_from, int gen = -1) {
-        std::lock_guard<std::mutex> lock(window_mu);
-        if (!active.load() || (gen >= 0 && seek_generation.load() != gen)) return;
-        if (scheduler) scheduler->retain(id, [&](int p) {
-            return p <= head_end_piece || p >= tail_start_piece
-                || (p >= new_from && p <= new_from + window_pieces());
-        });
-        window_gen = -1;
-        window_lo = deadline_hi = priority_hi = -1;
-    }
-
-    void request_piece(int piece, int gen, int deadline_ms = 0) {
-        std::lock_guard<std::mutex> lock(window_mu);
-        if (active.load() && seek_generation.load() == gen && scheduler)
-            scheduler->request(id, piece, 7, deadline_ms);
-    }
-
-    void release_piece(int piece, int gen) {
-        std::lock_guard<std::mutex> lock(window_mu);
-        if (active.load() && seek_generation.load() == gen && scheduler)
-            scheduler->release(id, piece);
+    void extend_window(TorrReader& reader, int from) {
+        if (!active.load() || !scheduler) return;
+        const int last = std::min(reader.request_last_piece, from + window_pieces());
+        const int last_deadline = std::min(last, from + deadline_pieces());
+        const int keep_from = std::max(reader.request_first_piece, from - TRAILING_WINDOW);
+        scheduler->retain(id, [&](int p) { return p >= keep_from && p <= last; }, reader.reader_id);
+        const int span = std::max(1, last - from);
+        // Only advance this connection's window. A short metadata probe must
+        // not start a full readahead window beyond the requested Range.
+        for (int p = std::max(from, reader.priority_hi + 1); p <= last; ++p)
+            scheduler->request(id, p, std::max(1, 7 - 6 * (p - from) / span), -1, reader.reader_id);
+        for (int p = std::max(from, reader.deadline_hi + 1); p <= last_deadline; ++p)
+            scheduler->request(id, p, 7, (p - from) * piece_play_ms(), reader.reader_id);
+        reader.priority_hi = std::max(reader.priority_hi, last);
+        reader.deadline_hi = std::max(reader.deadline_hi, last_deadline);
     }
 
     std::atomic<bool> active{true};
@@ -1760,20 +1773,17 @@ static bool reset_stream_data(SessionWrapper* sw, lt_torrent_id tid) {
 // ── piece waiting — port of blocking read in TorrServer's Reader.Read ────────
 // blocks until piece is downloaded and verified — zero CPU polling
 
-static bool wait_for_piece(StreamEngine* s, int piece, int timeout_ms,
-                           int gen = -1) {
-    if (gen < 0) gen = s->seek_generation.load();
+static bool wait_for_piece(StreamEngine* s, int piece, int timeout_ms) {
     std::unique_lock<std::mutex> lk(s->piece_mu);
     if (s->pieces_have.count(piece)) return true;
 
     // deadline + top priority — triggers time-critical download from multiple peers
     lk.unlock();
-    try { s->request_piece(piece, gen); } catch (...) {}
+    try { if (s->scheduler) s->scheduler->request(s->id, piece, 7, 0); } catch (...) {}
     lk.lock();
 
     return s->piece_cv.wait_for(lk, chr::milliseconds(timeout_ms),
         [&]{ return !s->active.load()
-                 || s->seek_generation.load() != gen
                  || s->pieces_have.count(piece) > 0; })
         && s->pieces_have.count(piece) > 0;
 }
@@ -1781,8 +1791,8 @@ static bool wait_for_piece(StreamEngine* s, int piece, int timeout_ms,
 // Read piece data directly from libtorrent disk storage.
 // Like lt2http: storage()->readv() — reads downloaded piece data.
 static ReadResult read_piece_data(StreamEngine* s, int piece,
-                                  int timeout_ms = 5000, int gen = -1) {
-    if (gen < 0) gen = s->seek_generation.load();
+                                  int timeout_ms = 5000,
+                                  const std::function<bool()>& cancelled = {}) {
 
     // Check hot piece cache first — instant for re-reads
     if (s->cache) {
@@ -1821,17 +1831,17 @@ static ReadResult read_piece_data(StreamEngine* s, int piece,
     }
 
     std::unique_lock<std::mutex> lk(s->read_mu);
-    if (s->read_cv.wait_for(lk, chr::milliseconds(timeout_ms),
-            [&]{ return !s->active.load()
-                     || s->read_results.count(piece) > 0
-                     || s->has_cached_piece(piece)
-                     || s->seek_generation.load() != gen; })) {
-        auto it = s->read_results.find(piece);
-        if (it != s->read_results.end()) {
-            ReadResult r = std::move(it->second);
-            s->read_results.erase(it);
-            return r;
-        }
+    const auto deadline = chr::steady_clock::now() + chr::milliseconds(timeout_ms);
+    while (s->active.load() && !(cancelled && cancelled()) && chr::steady_clock::now() < deadline) {
+        if (s->read_results.count(piece) || s->has_cached_piece(piece)) break;
+        s->read_cv.wait_until(lk, std::min(deadline, chr::steady_clock::now() + chr::milliseconds(200)));
+    }
+    if (!s->active.load() || (cancelled && cancelled())) return {};
+    auto result = s->read_results.find(piece);
+    if (result != s->read_results.end()) {
+        ReadResult data = std::move(result->second);
+        s->read_results.erase(result);
+        return data;
     }
     lk.unlock();
     if (s->cache) {
@@ -1855,6 +1865,7 @@ struct RangeReq {
     int64_t end   = -1;
     bool    valid = false;
     bool    is_suffix = false;
+    std::string header;
 };
 
 static RangeReq parse_range(const char* buf, int len) {
@@ -1871,6 +1882,9 @@ static RangeReq parse_range(const char* buf, int len) {
     auto end = s.find('\r', pos);
     if (end == std::string::npos) end = s.size();
     std::string rs = s.substr(pos, end - pos);
+    r.header = rs.substr(0, 256);
+    for (auto& ch : r.header)
+        if (static_cast<unsigned char>(ch) < 32 || static_cast<unsigned char>(ch) > 126) ch = '?';
     auto dash = rs.find('-');
     if (dash != std::string::npos) {
         try {
@@ -1897,6 +1911,44 @@ static int send_all(socket_t sock, const char* data, int len) {
     return sent;
 }
 
+static bool http_client_closed(socket_t client) {
+#ifdef _WIN32
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(client, &readable);
+    timeval timeout{0, 0};
+    const int selected = ::select(0, &readable, nullptr, nullptr, &timeout);
+#else
+    // File descriptors in a Flutter app may exceed select's FD_SETSIZE.
+    pollfd descriptor{client, POLLIN, 0};
+    const int selected = ::poll(&descriptor, 1, 0);
+    if (selected > 0 && (descriptor.revents & (POLLERR | POLLNVAL))) return true;
+#endif
+    if (selected == 0) return false;
+    if (selected > 0) {
+        char byte;
+        const int received = ::recv(client, &byte, 1, MSG_PEEK);
+        if (received >= 0) return received == 0;
+    }
+#ifdef _WIN32
+    const int error = WSAGetLastError();
+    return error != WSAEINTR && error != WSAEWOULDBLOCK;
+#else
+    return errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK;
+#endif
+}
+
+static bool wait_for_http_piece(StreamEngine* s, int piece, socket_t client) {
+    const auto deadline = chr::steady_clock::now() + chr::seconds(180);
+    std::unique_lock<std::mutex> lock(s->piece_mu);
+    while (s->active.load() && !http_client_closed(client)) {
+        if (s->pieces_have.count(piece)) return true;
+        if (chr::steady_clock::now() >= deadline) break;
+        s->piece_cv.wait_until(lock, std::min(deadline, chr::steady_clock::now() + chr::milliseconds(200)));
+    }
+    return false;
+}
+
 // serve_range — based on lt2http's Reader::read() pattern
 //
 // lt2http reads directly from libtorrent storage — no intermediate cache.
@@ -1905,21 +1957,13 @@ static int send_all(socket_t sock, const char* data, int len) {
 // disk-read prefetch is separately limited to the next two available pieces.
 static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
                         int64_t range_start, int64_t range_end) {
-    int my_gen = s->seek_generation.load();
     int64_t cursor = range_start;
-    TB_LOG("serve_range: start=%lld end=%lld gen=%d", (long long)range_start, (long long)range_end, my_gen);
-
-    bool is_tail = (range_start > s->file_size - s->piece_length * 10);
-
-    if (!is_tail) {
-        reader->offset = range_start;
-        reader->last_access = TorrReader::now_unix();
-        s->read_head.store(range_start);
-    }
+    if (!s->begin_http_reader(*reader, range_start, range_end)) return false;
+    reader->offset = cursor;
+    reader->last_access = TorrReader::now_unix();
 
     while (cursor <= range_end && s->active.load()) {
-        if (s->seek_generation.load() != my_gen) return false;
-
+        if (http_client_closed(cli)) return false;
         int p = std::clamp(s->byte_to_piece(cursor), s->start_piece, s->end_piece);
 
         int64_t pfbeg, pfend;
@@ -1938,38 +1982,18 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
             have_it = s->pieces_have.count(p) > 0;
         }
 
-        if (!is_tail) s->extend_window(p, my_gen);
+        s->extend_window(*reader, p);
 
         if (!have_it) {
-            try {
-                s->request_piece(p, my_gen);
-            } catch (...) {}
-
-            // Wait for piece — like lt2http's sleep_for(300ms) polling loop
-            // but using condition variable for zero-latency wakeup
-            TB_LOG("serve_range: WAITING for piece=%d", p);
-            std::unique_lock<std::mutex> lk(s->piece_mu);
-            bool ok = s->piece_cv.wait_for(lk, chr::seconds(180), [&] {
-                return !s->active.load()
-                    || s->seek_generation.load() != my_gen
-                    || s->pieces_have.count(p) > 0;
-            });
-
-            if (!s->active.load() || s->seek_generation.load() != my_gen) {
-                TB_LOG("serve_range: ABORT piece=%d gen_now=%d my_gen=%d", p, s->seek_generation.load(), my_gen);
-                return false;
-            }
-            if (!ok || s->pieces_have.count(p) == 0) {
-                TB_LOG("serve_range: TIMEOUT piece=%d", p);
-                return false;
-            }
-            TB_LOG("serve_range: piece=%d READY", p);
+            s->update_http_reader(reader->reader_id, cursor, true);
+            TB_LOG("HTTP wait stream=%lld reader=%d piece=%d", (long long)s->id, reader->reader_id, p);
+            if (!wait_for_http_piece(s, p, cli)) return false;
         }
 
         // ── piece is downloaded — read data directly via read_piece ──
         // Like lt2http: storage()->readv(b, p, offset, ...)
         // We use read_piece_data which does read_piece → waits for data
-        ReadResult rd = read_piece_data(s, p, 10000, my_gen);
+        ReadResult rd = read_piece_data(s, p, 10000, [&] { return http_client_closed(cli); });
         if (!rd.ok || rd.data.empty()) {
             TB_LOG("serve_range: read_piece_data FAILED piece=%d", p);
             return false;
@@ -2020,38 +2044,11 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
 
         cursor = sbeg + nb;
 
-        if (!is_tail) {
-            reader->offset = cursor;
-            reader->last_access = TorrReader::now_unix();
-            s->read_head.store(cursor);
-        }
-
-        if (s->stream_state.load() != LT_STREAM_READY)
-            s->stream_state.store(LT_STREAM_READY);
-
-        // Trailing retention — keep last N played pieces for re-reads.
-        // Only drop pieces that fall off the trailing window.
-        {
-            std::lock_guard<std::mutex> tlk(s->trailing_mu);
-            // avoid duplicates (piece already in trailing window)
-            if (s->trailing_pieces.empty() || s->trailing_pieces.back() != p)
-                s->trailing_pieces.push_back(p);
-            while ((int)s->trailing_pieces.size() > StreamEngine::TRAILING_WINDOW) {
-                int old_p = s->trailing_pieces.front();
-                s->trailing_pieces.pop_front();
-                try {
-                    s->release_piece(old_p, my_gen);
-                } catch (...) {}
-                s->drop_cached(old_p);
-                {
-                    std::lock_guard<std::mutex> rlk(s->read_mu);
-                    s->read_results.erase(old_p);
-                }
-            }
-        }
+        reader->offset = cursor;
+        reader->last_access = TorrReader::now_unix();
+        s->update_http_reader(reader->reader_id, cursor, false);
     }
-    TB_LOG("serve_range: DONE cursor=%lld end=%lld", (long long)cursor, (long long)range_end);
-    return true;
+    return cursor > range_end;
 }
 
 // handle_connection — port of torr/stream.go Stream()
@@ -2063,20 +2060,6 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
 
     TorrReader* reader = nullptr;
     try {
-
-    // Create reader for this connection — port of t.NewReader(file)
-    // NOTE: assigns to the OUTER reader variable (line 1485) so that
-    // close_reader at cleanup: actually frees it. The previous code
-    // re-declared `TorrReader* reader` here, shadowing the outer one,
-    // so close_reader always received nullptr → TorrReader leaked.
-    reader = s->cache->new_reader(
-        reader_id, s->file_index, s->file_offset, s->file_size);
-
-    // port of: reader.SetResponsive() — set readahead to 16MB (TorrServer's updateRA)
-    reader->set_readahead(StreamEngine::FIXED_READAHEAD);
-
-    // Adjust all readers' readahead — port of torrent.go updateRA()
-    s->cache->adjust_readahead(StreamEngine::FIXED_READAHEAD);
 
     int opt = 1;
     ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
@@ -2150,71 +2133,12 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
             int64_t clen = rend - rstart + 1;
             bool is_partial = (rr.valid && (rr.start >= 0 || rr.is_suffix));
 
-            // seek detection — 1-to-1 port of TorrServer's seek path
-            //
-            // TorrServer's clearPriority() sets pieces OUTSIDE reader ranges to
-            // PiecePriorityNone. Then setLoadPriority() sets pieces near reader
-            // to descending priorities (Now/Next/Readahead/High/Normal).
-            //
-            // On seek we withdraw only this stream's obsolete demands and
-            // merge fresh deadlines without cancelling other streams.
-            // This stops old time-critical picks without disrupting peer
-            // connections (unlike batch-resetting ALL pieces to dont_download).
-            int64_t old_head = s->read_head.load();
-            bool is_tail_req = (rstart > fsz - s->piece_length * 10);
-            TB_LOG("handle_conn: rstart=%lld rend=%lld old_head=%lld is_tail=%d",
-                   (long long)rstart, (long long)rend, (long long)old_head, is_tail_req?1:0);
-            if (!is_tail_req && old_head > 0 && std::abs(rstart - old_head) > 65536) {
-                int new_gen = s->seek_generation.fetch_add(1) + 1;
-                TB_LOG("SEEK DETECTED: old_head=%lld new_pos=%lld seek_piece=%d gen=%d",
-                       (long long)old_head, (long long)rstart,
-                       std::clamp(s->byte_to_piece(rstart), s->start_piece, s->end_piece), new_gen);
-                s->stream_state.store(LT_STREAM_SEEKING);
-                s->read_head.store(rstart);
-
-                // port of Reader.Seek: update reader position + readerOn()
-                reader->offset = rstart;
-                reader->last_access = TorrReader::now_unix();
-                reader->reader_on();
-
-                // wake old serve_range so it exits on generation mismatch
-                s->piece_cv.notify_all();
-
-                // Free stale read_results from the old playback position.
-                // Without this, each seek leaks ~2MB of piece data that
-                // serve_range was about to consume but abandoned.
-                {
-                    std::lock_guard<std::mutex> rlk(s->read_mu);
-                    s->read_results.clear();
-                }
-                s->read_cv.notify_all();
-
-                // Flush trailing retention window — drop old pieces to
-                // free bandwidth for the new seek position
-                {
-                    std::lock_guard<std::mutex> tlk(s->trailing_mu);
-                    for (int old_p : s->trailing_pieces) {
-                        try {
-                            s->release_piece(old_p, new_gen);
-                        } catch (...) {}
-                        s->drop_cached(old_p);
-                    }
-                    s->trailing_pieces.clear();
-                }
-
-                int seek_piece = std::clamp(s->byte_to_piece(rstart),
-                                            s->start_piece, s->end_piece);
-                try {
-                    // Cancel the old window, prioritize the seek target, and
-                    // let serve_range extend a new window from that position.
-                    s->drop_window(seek_piece, new_gen);
-                    s->request_piece(seek_piece, new_gen);
-                    // If the seek target is already on disk, kick a read
-                    // immediately so serve_range's read_piece_data returns
-                    // without an extra round-trip.
-                    s->handle.read_piece(lt::piece_index_t(seek_piece));
-                } catch (...) {}
-            }
+            TB_LOG("HTTP request stream=%lld reader=%d method=%s Range=%s resolved=%lld-%lld",
+                   (long long)s->id, reader_id, is_head ? "HEAD" : "GET",
+                   rr.valid ? rr.header.c_str() : "(none)", (long long)rstart, (long long)rend);
+            // Each connection serves one GET and closes. A different connection
+            // may be a container/index probe, a retry, or a real user seek.
+            // Its Range cannot be used to cancel another live connection.
 
             // get filename — port of stream.go MIME detection
             std::string filename = "video.mp4";
@@ -2251,9 +2175,12 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
             if (send_all(cli, h.c_str(), (int)h.size()) < 0) goto cleanup;
 
             if (is_get) {
-                TB_LOG("handle_conn: calling serve_range rstart=%lld rend=%lld", (long long)rstart, (long long)rend);
+                reader = s->cache->new_reader(reader_id, s->file_index, s->file_offset, s->file_size);
+                reader->set_readahead(StreamEngine::FIXED_READAHEAD);
                 bool sr_ok = serve_range(s, reader, cli, rstart, rend);
-                TB_LOG("handle_conn: serve_range returned %d", (int)sr_ok);
+                TB_LOG("HTTP body stream=%lld reader=%d result=%s bytes=%lld",
+                       (long long)s->id, reader_id, sr_ok ? "complete" : "interrupted",
+                       (long long)std::max<int64_t>(0, reader->offset - rstart));
                 if (!sr_ok) goto cleanup;
             }
 
@@ -2261,20 +2188,19 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
             goto cleanup;
         }
     }
+    } catch (const std::exception& error) {
+        TB_LOG("HTTP error stream=%lld reader=%d: %s", (long long)s->id, reader_id, error.what());
+    } catch (...) {
+        TB_LOG("HTTP error stream=%lld reader=%d: unknown exception", (long long)s->id, reader_id);
+    }
 
 cleanup:
-    // port of stream.go: defer t.CloseReader(reader)
-    try {
-        if (s->cache && reader) s->cache->close_reader(reader);
-    } catch (...) {}
-
-    // port of stream.go: defer atomic.AddInt32(&activeStreams, -1)
-    StreamEngine::active_streams.fetch_add(-1);
-
-    } catch (...) {
-        // Never crash in client handler — just clean up
-        StreamEngine::active_streams.fetch_add(-1);
+    // Also withdraw failed/closed requests. Never revoke another reader's picks.
+    if (reader) {
+        s->finish_http_reader(reader_id);
+        if (s->cache) s->cache->close_reader(reader);
     }
+    StreamEngine::active_streams.fetch_add(-1);
 }
 
 // run_http_server — accepts connections, each gets its own TorrReader
