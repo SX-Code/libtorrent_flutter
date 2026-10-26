@@ -165,7 +165,25 @@ jobs:
           echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
 
       - name: Install Boost and OpenSSL
-        run: C:\vcpkg\vcpkg.exe install boost-headers:${{ matrix.triplet }} openssl:${{ matrix.triplet }}
+        run: |
+          # boost-headers supplies CMake metadata, not the individual Boost modules.
+          # Install the modules used by libtorrent 2.1.1 with webtorrent disabled.
+          $ports = @(
+            'boost-headers', 'boost-asio', 'boost-chrono', 'boost-config',
+            'boost-container', 'boost-crc', 'boost-date-time', 'boost-functional',
+            'boost-intrusive', 'boost-iterator', 'boost-logic', 'boost-multi-index',
+            'boost-multiprecision', 'boost-pool', 'boost-predef', 'boost-random',
+            'boost-range', 'boost-scope-exit', 'boost-smart-ptr', 'boost-system',
+            'boost-variant', 'openssl'
+          )
+          $packages = $ports | ForEach-Object { "${_}:${{ matrix.triplet }}" }
+          C:\vcpkg\vcpkg.exe install @packages
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($header in @('config.hpp', 'asio.hpp', 'system/error_code.hpp', 'container/map.hpp')) {
+            if (!(Test-Path "C:/vcpkg/installed/${{ matrix.triplet }}/include/boost/$header")) {
+              throw "Missing installed Boost header: $header"
+            }
+          }
         timeout-minutes: 90
 
       - name: Build libtorrent and bridge
@@ -335,6 +353,7 @@ jobs:
           cmake -S src -B build-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_static \
+            -DLibtorrentRasterbar_DIR="$PWD/lt-install/lib/cmake/LibtorrentRasterbar" \
             -DCMAKE_PREFIX_PATH="$PWD/lt-install" -DBOOST_ROOT="$BOOST_ROOT" -DBoost_INCLUDE_DIR="$BOOST_ROOT" \
             -DOPENSSL_INCLUDE_DIR="$OPENSSL_ROOT/include" \
             -DOPENSSL_SSL_LIBRARY="$OSSL_LIB_DIR/libssl.a" -DOPENSSL_CRYPTO_LIBRARY="$OSSL_LIB_DIR/libcrypto.a"

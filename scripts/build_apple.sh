@@ -74,7 +74,9 @@ build_slice() {
     -DLTF_STATIC_BRIDGE="$static_bridge" -DLTF_BUILD_TESTS="$native_tests"
   cmake --build "$slice" --parallel "$JOBS"
   if [[ "$family" == macos ]]; then
-    if otool -L "$slice/liblibtorrent_flutter.dylib" | grep -E '/opt/homebrew|/usr/local|build/apple'; then
+    # The first line names the inspected file, which lives under build/apple.
+    # Check only dependency entries, not that header.
+    if otool -L "$slice/liblibtorrent_flutter.dylib" | sed '1d' | grep -E '/opt/homebrew|/usr/local|build/apple'; then
       echo 'Unexpected local runtime dependency in macOS dylib' >&2; exit 1
     fi
     if [[ "$native_tests" == ON ]]; then ctest --test-dir "$slice" --output-on-failure; fi

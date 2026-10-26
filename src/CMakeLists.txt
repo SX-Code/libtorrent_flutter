@@ -11,23 +11,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Inherit the dependency's ABI/feature macros. The bridge needs
 # deprecated-functions=ON in 2.1.1 (torrent_info::files).
-find_package(LibtorrentRasterbar 2.1.1 CONFIG QUIET)
-if(LibtorrentRasterbar_FOUND)
-  set(LTF_TORRENT_TARGET LibtorrentRasterbar::torrent-rasterbar)
-  # libtorrent 2.1.1 exports a consumer-Debug assertion macro even when only
-  # a Release library is installed. Assertions change aux::unique_ptr's size,
-  # hence torrent_status's layout. Match the installed library, not the app.
-  get_target_property(LTF_IMPORTED_CONFIGS ${LTF_TORRENT_TARGET} IMPORTED_CONFIGURATIONS)
-  if(LTF_IMPORTED_CONFIGS AND NOT "DEBUG" IN_LIST LTF_IMPORTED_CONFIGS)
-    get_target_property(LTF_TORRENT_DEFINITIONS ${LTF_TORRENT_TARGET} INTERFACE_COMPILE_DEFINITIONS)
-    list(REMOVE_ITEM LTF_TORRENT_DEFINITIONS "$<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>")
-    set_property(TARGET ${LTF_TORRENT_TARGET} PROPERTY INTERFACE_COMPILE_DEFINITIONS "${LTF_TORRENT_DEFINITIONS}")
-  endif()
-else()
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(LIBTORRENT REQUIRED IMPORTED_TARGET libtorrent-rasterbar>=2.1.1)
-  set(LTF_TORRENT_TARGET PkgConfig::LIBTORRENT)
+# Require the exported target: host pkg-config fallback loses target library
+# locations when cross-compiling (notably with the Android NDK).
+find_package(LibtorrentRasterbar 2.1.1 CONFIG REQUIRED)
+set(LTF_TORRENT_TARGET LibtorrentRasterbar::torrent-rasterbar)
+# libtorrent 2.1.1 exports a consumer-Debug assertion macro even when only
+# a Release library is installed. Assertions change aux::unique_ptr's size,
+# hence torrent_status's layout. Match the installed library, not the app.
+get_target_property(LTF_IMPORTED_CONFIGS ${LTF_TORRENT_TARGET} IMPORTED_CONFIGURATIONS)
+if(LTF_IMPORTED_CONFIGS AND NOT "DEBUG" IN_LIST LTF_IMPORTED_CONFIGS)
+  get_target_property(LTF_TORRENT_DEFINITIONS ${LTF_TORRENT_TARGET} INTERFACE_COMPILE_DEFINITIONS)
+  list(REMOVE_ITEM LTF_TORRENT_DEFINITIONS "$<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>")
+  set_property(TARGET ${LTF_TORRENT_TARGET} PROPERTY INTERFACE_COMPILE_DEFINITIONS "${LTF_TORRENT_DEFINITIONS}")
 endif()
+
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
