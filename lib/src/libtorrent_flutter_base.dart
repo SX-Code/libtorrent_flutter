@@ -536,8 +536,7 @@ class LibtorrentFlutter {
   ) {
     // Silently consume alerts — users can listen to torrentUpdates for state changes.
     // Uncomment for debugging:
-    final msg = message.toDartString();
-    print('LibtorrentFlutter Alert: [T$torrentId] $msg');
+    // Native diagnostics can be enabled with TB_LOG_FILE when needed.
   }
 
   void _pollTorrents() {
