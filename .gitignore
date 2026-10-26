@@ -28,8 +28,3 @@ __pycache__/
 *.pyc
 
 /example
-
-# Local analysis documents
-/需求分析.md
-/合并可行性分析.md
-/移植实施记录.md
