@@ -1,0 +1,21 @@
+# Generated dependencies and native outputs
+/build*/
+/src/build*/
+/prebuilt/
+/ios/*.a
+/ios/*.xcframework/
+/macos/*.dylib
+**/Pods/
+**/.symlinks/
+**/.dart_tool/
+**/build/
+**/.gradle/
+**/local.properties
+**/pubspec.lock
+**/.flutter-plugins*
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.tmp
+*:Zone.Identifier
