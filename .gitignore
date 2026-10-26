@@ -1,7 +1,11 @@
 # Generated dependencies and native outputs
 /build*/
 /src/build*/
-/prebuilt/
+# Keep prebuilt layout and instructions, but exclude downloaded artifacts
+/prebuilt/**
+!/prebuilt/**/
+!/prebuilt/**/.gitkeep
+!/prebuilt/README.md
 /ios/*.a
 /ios/*.xcframework/
 /macos/*.dylib
@@ -22,3 +26,5 @@
 
 __pycache__/
 *.pyc
+
+/example
