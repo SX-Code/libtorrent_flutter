@@ -23,8 +23,8 @@ bash scripts/build_apple.sh all
 ```
 
 The GitHub Actions workflow builds all five platforms and uploads artifacts; it
-does not publish releases. See [移植实施记录.md](移植实施记录.md) for the migration,
-validation status, supported architectures and artifact installation paths.
+does not publish releases. See [artifact installation instructions](prebuilt/README.md)
+for local validation setup. All-platform CI and device validation are still pending.
 
 ## Why libtorrent?
 
@@ -215,7 +215,7 @@ FlutterForegroundTask.startService(
 ## Native artifacts and offline builds
 
 Build with `.github/workflows/build.yml` or the Apple script above. Install the
-artifacts at the paths documented in [移植实施记录.md](移植实施记录.md).
+artifacts at the paths documented in [artifact installation instructions](prebuilt/README.md).
 Missing native libraries are downloaded by default from
 `https://github.com/SX-Code/libtorrent_flutter/releases/download/v<pubspec-version>`.
 For the current version, publish the ZIP assets under tag `v2.0.1-dev.1`.
