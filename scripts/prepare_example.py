@@ -20,6 +20,7 @@ subprocess.run([flutter, 'create', '--platforms=' + args.platform,
 tests = example / 'integration_test'
 tests.mkdir(exist_ok=True)
 shutil.copyfile(root / 'test/integration/engine_smoke.dart', tests / 'engine_test.dart')
+shutil.copyfile(root / 'test/integration/stream_start_checks.dart', tests / 'stream_start_checks.dart')
 if args.platform == 'macos':
     for name in ['DebugProfile', 'Release']:
         path = example / 'macos/Runner' / (name + '.entitlements')

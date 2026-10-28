@@ -3,9 +3,14 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
+import 'stream_start_checks.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('startup waits survive timeout and follow stream lifecycle', (tester) async {
+    await checkStreamStartWaits();
+  });
 
   testWidgets('native exports, session lifecycle and input error cross FFI',
       (tester) async {

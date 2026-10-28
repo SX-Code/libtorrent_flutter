@@ -174,6 +174,10 @@ TORRENT_API lt_stream_id lt_switch_file(lt_session_t session,
 TORRENT_API void         lt_stop_stream(lt_session_t session, lt_stream_id id);
 /* keep_torrent=0 removes the torrent/files only when its last stream stops. */
 TORRENT_API void         lt_stop_stream_ex(lt_session_t session, lt_stream_id id, int keep_torrent);
+/* Non-blocking startup probe: 1=verified/readable first piece, 0=pending,
+ * -1=invalid stream/session, -2=unexpected native error (lt_last_error).
+ * Does not stop streams or withdraw download demands. */
+TORRENT_API int lt_check_stream_start(lt_session_t session, lt_stream_id stream_id);
 TORRENT_API int          lt_get_stream_status(lt_session_t session,
                                               lt_stream_id id,
                                               lt_stream_status* out);

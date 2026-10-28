@@ -1,5 +1,7 @@
 # libtorrent_flutter
 
+[English](README.md) | [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md) | [中文更新日志](CHANGELOG.zh-CN.md)
+
 Native **libtorrent 2.1.1** bindings for Flutter with a local HTTP streaming server.
 This development branch ports the 1.8.7 fork's bounded cache and sliding download
 window onto the 2.0.0 source snapshot. It targets iOS, macOS, Android, Linux and Windows.
@@ -22,17 +24,18 @@ On a Mac with Xcode, CMake and Ninja installed:
 bash scripts/build_apple.sh all
 ```
 
-The GitHub Actions workflow builds all five platforms and uploads artifacts; it
-does not publish releases. See [artifact installation instructions](prebuilt/README.md)
+The GitHub Actions workflow currently builds only iOS for debugging; the other
+four platform jobs are temporarily disabled. It uploads artifacts without
+publishing releases. See [artifact installation instructions](prebuilt/README.md)
 for local validation setup. All-platform CI and device validation are still pending.
 
 ## Why libtorrent?
 
-Every other Flutter torrent package uses either a Java wrapper (Android-only) or a pure-Dart implementation that can't compete on speed. libtorrent 2.1.1 gives you:
+libtorrent 2.1.1 provides native torrent networking and piece scheduling:
 
-- **`set_piece_deadline`** — tells the engine "I need this piece in 150ms", and it picks the fastest peer automatically. Far smarter than simple sequential download.
-- **uTP support** — connects to peers behind NAT that other clients can't reach.
-- **On-demand streaming** — focuses 100% of startup bandwidth on the first pieces. Container metadata (MP4 moov, MKV cues) is fetched reactively when the player requests it via HTTP range requests, cutting startup time to seconds.
+- **`set_piece_deadline`** — expresses piece urgency so the time-critical picker can prioritize requests. It is a scheduling target, not a delivery-time guarantee.
+- **uTP support** — supports UDP-based peer transport alongside TCP; connectivity still depends on the network and NAT configuration.
+- **On-demand streaming** — prioritizes startup pieces, prefetches head/tail data, and follows the player's HTTP Range requests. Startup time depends on peer availability, bandwidth and container layout.
 - **DHT + PEX + LSD** — finds peers without trackers.
 
 ## Usage
@@ -92,7 +95,7 @@ engine.torrentUpdates.listen((Map<int, TorrentInfo> torrents) {
   print('${t.numSeeds}');
   print('${t.hasMetadata}');   // true once file list is available
   print('${t.totalDone}');     // bytes downloaded
-  print('${t.totalWanted}');   // bytes total
+  print('${t.totalWanted}');   // currently selected bytes; may change during streaming
 });
 
 // Or get a snapshot right now
@@ -118,8 +121,8 @@ final StreamInfo stream = engine.startStream(id);
 final StreamInfo stream = engine.startStream(id, fileIndex: 2);
 
 // With a RAM cache limit — useful on mobile
-// A 500MB sliding window: the engine evicts old pieces as you watch,
-// keeping a 10% safety buffer behind playback so it never stutters.
+// A 500 MiB RAM budget: old in-memory pieces are evicted as reads advance.
+// This does not limit downloaded files on disk or guarantee stall-free playback.
 final StreamInfo stream = engine.startStream(
   id,
   fileIndex: 2,
@@ -137,7 +140,7 @@ engine.streamUpdates.listen((Map<int, StreamInfo> streams) {
   for (final s in streams.values) {
     print('url: ${s.url}');
     print('ready: ${s.isReady}');       // HTTP reader readiness, not decoder state
-    print('buffer: ${s.bufferPct}%');   // 0–100 buffered ahead
+    print('buffer: ${(s.bufferPct * 100).toStringAsFixed(1)}%'); // ahead window, not whole file
     print('fileSize: ${s.fileSize}');
     print('readHead: ${s.readHead}');   // primary HTTP reader's byte position
   }
@@ -195,6 +198,44 @@ final next = engine.switchFile(torrentId, fileIndex: nextFileIndex);
 engine.removeTorrent(torrentId, deleteFiles: true);
 ```
 
+Before passing a new stream URL to the player, optionally wait for its first
+piece to be verified and successfully read. This works after either
+`startStream` or `switchFile` and does not block the Dart event loop:
+
+```dart
+final result = await engine.waitForStreamStart(
+  next.id,
+  timeout: const Duration(seconds: 15),
+);
+switch (result) {
+  case StreamStartResult.ready:
+    // If this is still the user's selected stream, open next.url in the player.
+    break;
+  case StreamStartResult.timeout:
+    // Keep next.id/next.url. Show a retry action which waits on next.id again.
+    // Do not call switchFile again: that would delete the data just downloaded.
+    break;
+  case StreamStartResult.invalid:
+    // The stream was stopped/replaced/removed, or the engine was disposed.
+    // Discard this result; do not reopen this URL.
+    break;
+}
+```
+
+Timeout only ends that caller's wait; the stream, URL, download demands and
+other waiters survive. A repeated wait returns `ready` immediately once the first
+piece has been verified/read. Zero timeout performs a single check; negative
+timeouts throw `ArgumentError`. Validity is checked before readiness and timeout.
+`ready` does not guarantee an immediate video frame: container probing may need
+more data. Guard against stale callbacks if the user switches episodes again.
+This API requires rebuilt native artifacts exporting `lt_check_stream_start`.
+
+Add the magnet once and retain its `torrentId` for episode changes. Repeated
+`addMagnet`/`addTorrentFile` calls for the same torrent return the existing ID,
+keeping its original save path and state. A conflicting `streamOnly` mode throws.
+This is one shared task, not separate ownership references: switching or removing
+that ID affects all its streams.
+
 `startStream` only opens a stream; it never deletes data or stops other streams.
 It allows different files to stream simultaneously in both download modes. Their
 downloaded data is retained and may accumulate. Use `switchFile` for episode
@@ -202,7 +243,11 @@ changes when old streams and data should be cleared.
 
 `switchFile` ends all streams of the specified torrent, deletes its downloaded data (including partial data in libtorrent's partfile),
 and resets the owned-piece state before the next episode starts. The torrent ID,
-metadata, file list and discovery settings are retained. BT connections reconnect;
+metadata, file list and discovery settings are retained. Up to 64 known outgoing
+peer endpoints are retained (preferring connected seeds) and supplied to the new
+torrent for reconnection without waiting for discovery. These are connection
+hints, not preserved sockets or a guarantee that a peer remains reachable.
+BT connections reconnect;
 the magnet metadata does not need to be downloaded again. After a switch only the
 new stream remains. Repeated `switchFile` calls retain the current episode's data,
 not ten episodes after ten switches. Repeated `startStream` calls keep old streams
@@ -265,9 +310,9 @@ engine.setDownloadLimit(0);                 // back to unlimited
 
 ## Platform setup
 
-No changes needed on Windows, Linux, and Android — everything is bundled.
+All platforms require matching native artifacts; see the build/install section below.
 
-**iOS** — add the network entitlement. In your `ios/Runner/Info.plist`, ensure your app allows outgoing connections (this is allowed by default on iOS, but if you use a custom `NetworkExtension` or have restrictive `NSAppTransportSecurity` settings, make sure HTTP to `localhost` is permitted).
+**iOS** — ensure your app permits HTTP access to the local streaming server. Check `ios/Runner/Info.plist` if you use restrictive `NSAppTransportSecurity` settings or a custom `NetworkExtension`.
 
 **macOS** — add the network entitlement to your `macos/Runner/*.entitlements`:
 
@@ -284,7 +329,7 @@ No changes needed on Windows, Linux, and Android — everything is bundled.
 <uses-permission android:name="android.permission.INTERNET" />
 ```
 
-**Android background streaming** — Android kills your app's process when it goes to the background unless you use a Foreground Service. When streaming, start one to keep the engine alive:
+**Android background streaming** — Android may restrict or terminate background apps. Use a Foreground Service when continued background streaming is needed, following the target Android version's requirements:
 
 ```dart
 // Use flutter_foreground_task or a similar package
@@ -322,15 +367,16 @@ been downloaded beforehand.
 
 ## How it works
 
-A single C++ file (`torrent_bridge.cpp`) wraps libtorrent 2.0 and compiles to a native static/shared library on every platform. Dart talks to it via FFI — no platform channels, no Kotlin, no Swift.
+A single C++ file (`torrent_bridge.cpp`) wraps libtorrent 2.1.1 and compiles to a native static/shared library on each platform. Dart calls the engine via FFI without platform channels.
 
 When you call `startStream()`:
-1. The engine estimates media bitrate from file size and computes an adaptive startup piece count (1–5 pieces instead of a fixed number) — large files start faster because fewer pieces need to arrive before the player can begin
-2. Critical startup pieces get `set_piece_deadline(0)` triggering libtorrent's time-critical mode, which requests them from multiple peers simultaneously and cancels slow ones. Tail pieces (moov atom) download at lower priority so they never steal bandwidth from the first frame
-3. A tiny HTTP server starts on `127.0.0.1` on a random free port, running its own accept thread
-4. The server responds to byte-range requests, blocking via condition variables until each piece arrives — zero CPU polling. A hot piece cache serves repeated reads instantly without hitting disk
-5. Only the current playback piece + 2 ahead are prioritized — 100% of bandwidth goes to what the player needs right now. Played pieces stay in a trailing retention window (3 pieces) for quick rewinds and player re-reads
-6. On seek, old piece deadlines are cleared immediately, trailing pieces are dropped, and new deadlines are set at the seek target with tight spacing — all bandwidth redirects to the seek position within milliseconds
+
+1. The engine estimates bitrate from file size and selects 1–5 critical startup pieces.
+2. Critical head pieces get priority 7 and deadlines spaced 50 ms apart, starting at 0 ms. The remainder of the roughly 8 MiB head region gets priority 4; the roughly 8 MiB tail region gets priority 5 and a 1000 ms deadline.
+3. An HTTP server starts on `127.0.0.1` using a random free port and a dedicated accept thread.
+4. Each GET has its own bounded sliding download window. Missing pieces wait on condition variables with periodic disconnect/timeout checks; cached pieces can serve repeated reads without disk I/O. A piece blocking a read is promoted to priority 7 and deadline 0.
+5. The scheduler merges demands using the highest priority and earliest deadline. Independent probes cannot cancel one another. Disk prefetch reads up to two available pieces ahead; this is separate from the download window and the three-piece trailing window.
+6. HEAD does not alter scheduling. Finishing/disconnecting a GET removes only that reader's demands. The server does not infer user seeks from Range offsets; use player events to track seeks.
 
 The stream URL works with any player that handles HTTP range requests.
 

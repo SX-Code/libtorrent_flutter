@@ -18,6 +18,8 @@ static void init_test_stream(StreamEngine& stream, int piece_length, int count) 
     stream.piece_length = piece_length;
     stream.start_piece = 0;
     stream.end_piece = count - 1;
+    stream.start_piece = 0;
+    stream.end_piece = count - 1;
     stream.head_end_piece = 1;
     stream.tail_start_piece = count - 2;
     stream.cache = std::make_unique<TorrCache>();
@@ -71,6 +73,28 @@ static void test_window_and_range() {
     status.has_metadata = false;
     fill_status(empty, 1, status);
     require(empty.pieces_done == 0, "empty metadata status regression");
+    require(empty.state == LT_STATE_DOWNLOADING_META, "metadata state mapped to downloading");
+    const std::pair<lt::torrent_status::state_t, int> states[] = {
+        {lt::torrent_status::checking_files, LT_STATE_CHECKING_FILES},
+        {lt::torrent_status::downloading_metadata, LT_STATE_DOWNLOADING_META},
+        {lt::torrent_status::downloading, LT_STATE_DOWNLOADING},
+        {lt::torrent_status::finished, LT_STATE_FINISHED},
+        {lt::torrent_status::seeding, LT_STATE_SEEDING},
+        {lt::torrent_status::checking_resume_data, LT_STATE_CHECKING_RESUME},
+    };
+    status.progress = 1.0f;
+    for (const auto& state : states) {
+        status.state = state.first;
+        fill_status(empty, 1, status);
+        require(empty.state == state.second, "native state does not match the public C/Dart enum");
+    }
+    status.state = lt::torrent_status::finished;
+    status.progress = 0.5f;
+    fill_status(empty, 1, status);
+    require(empty.state == LT_STATE_DOWNLOADING, "incomplete demand window reported finished");
+    status.errc = lt::error_code(boost::system::errc::io_error, boost::system::generic_category());
+    fill_status(empty, 1, status);
+    require(empty.state == LT_STATE_ERROR, "storage error did not override torrent state");
 }
 
 static std::string http_request(int port, const std::string& method, const std::string& range) {
@@ -251,6 +275,24 @@ static void test_http_probes(lt_session_t session, const std::filesystem::path& 
     wait_until([&] { return scheduler->demand(probe_piece).priority == 0; }, "completed probe retained demands");
     require(handle.have_piece(lt::piece_index_t(probe_piece)), "completion discarded verified piece");
 
+    // A fast container probe can consume cached data faster than the estimated
+    // playback rate. Once it reaches a missing prefetched piece, that piece
+    // must become urgent instead of retaining its future playback deadline.
+    wait_until([&] {
+        std::lock_guard<std::mutex> lock(stream->http_mu);
+        return stream->http_readers.empty();
+    }, "completed probes left active readers");
+    PendingHttp sequential(stream->server_port, std::to_string(probe_piece * piece_length) + "-" +
+                           std::to_string((probe_piece + 2) * piece_length - 1));
+    wait_until([&] {
+        return stream->read_head == int64_t(probe_piece + 1) * piece_length
+            && stream->stream_state == LT_STREAM_BUFFERING;
+    }, "sequential probe did not reach missing prefetched piece");
+    require(scheduler->demand(probe_piece + 1).deadline <= chr::steady_clock::now(),
+            "blocked HTTP read retained a future prefetch deadline");
+    handle.add_piece(lt::piece_index_t(probe_piece + 1), later_piece.data());
+    require(sequential.body() == later_piece + later_piece, "sequential probe did not resume after piece arrival");
+
     // Removal must wake blocked GETs without waiting for the piece timeout.
     PendingHttp blocked(stream->server_port, std::to_string((probe_piece + 2) * piece_length) + "-");
     wait_until([&] { return scheduler->demand(probe_piece + 2).priority > 0; }, "blocked reader not scheduled");
@@ -291,12 +333,59 @@ static void test_local_upload(SessionWrapper* sw, lt_torrent_id id,
     require(sw->handles.at(id).status().total_payload_upload > 0, "upload counter did not advance");
 }
 
+// No DHT, trackers or LSD: the second episode must find the seed solely from
+// the endpoint captured before deleting/rebuilding the first episode's task.
+static void test_switch_reconnect(lt_session_t session, const std::filesystem::path& torrent_path,
+                                  const std::filesystem::path& folder) {
+    lt::settings_pack settings;
+    settings.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+    settings.set_bool(lt::settings_pack::enable_dht, false);
+    settings.set_bool(lt::settings_pack::enable_lsd, false);
+    settings.set_bool(lt::settings_pack::enable_upnp, false);
+    settings.set_bool(lt::settings_pack::enable_natpmp, false);
+    lt::session seed(settings);
+    lt::add_torrent_params params;
+    params.ti = std::make_shared<lt::torrent_info>(torrent_path.string());
+    params.save_path = folder.string();
+    params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::paused);
+    auto seed_handle = seed.add_torrent(params);
+    wait_until([&] { return seed_handle.status().is_seeding && seed.listen_port() != 0; }, "reconnect seed not ready");
+    const auto endpoint = lt::tcp::endpoint(lt::make_address("127.0.0.1"), seed.listen_port());
+    const auto cache = (folder / "reconnect-cache").string();
+    const auto id = lt_add_torrent_file(session, torrent_path.string().c_str(), cache.c_str(), 1);
+    require(id >= 0, "reconnect torrent add failed");
+    auto* sw = to_sw(session);
+    const auto first = lt_start_stream(session, id, 0, 512 * 1024);
+    require(first >= 0, "reconnect initial stream failed");
+    sw->handles.at(id).connect_peer(endpoint);
+    wait_until([&] { return lt_check_stream_start(session, first) == 1; }, "initial peer did not supply first piece");
+
+    const auto next = lt_switch_file(session, id, 1, 512 * 1024);
+    require(next >= 0, lt_last_error());
+    require(lt_check_stream_start(session, first) == -1, "reconnect retained old stream");
+    const auto& hints = sw->reconnect_peers.at(id);
+    require(std::find(hints.begin(), hints.end(), endpoint) != hints.end(), "switch lost known seed endpoint");
+    wait_until([&] { return lt_check_stream_start(session, next) == 1; }, "switch failed to reconnect without discovery");
+    const auto reply = http_request(sw->streams.at(next)->server_port, "GET", "0-499");
+    require(reply.size() - reply.find("\r\n\r\n") - 4 == 500, "reconnected episode could not serve HTTP");
+    lt_remove_torrent(session, id, 1);
+    require(sw->reconnect_peers.count(id) == 0, "final cleanup retained peer hints");
+}
+
 static void test_stream_lifecycle(lt_session_t session, const std::filesystem::path& torrent_path,
                                   const std::filesystem::path& folder) {
     auto* sw = to_sw(session);
     auto id = lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 0);
     require(id >= 0, "on-demand fixture rejected");
     auto handle = sw->handles.at(id);
+    lt_pause_torrent(session, id);
+    require(lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 0) == id,
+            "duplicate ordinary task did not reuse its ID");
+    require(bool(handle.flags() & lt::torrent_flags::paused), "duplicate add resumed a paused task");
+    require(lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 1) < 0,
+            "duplicate ordinary task accepted conflicting streamOnly mode");
+    require(sw->stream_only_torrents.count(id) == 0, "duplicate changed ordinary task cleanup policy");
+    lt_resume_torrent(session, id);
     wait_until([&] {
         auto state = handle.status().state;
         return state != lt::torrent_status::checking_files && state != lt::torrent_status::checking_resume_data;
@@ -436,11 +525,13 @@ static void test_current_episode(lt_session_t session, const std::filesystem::pa
             ? lt_start_stream(session, id, episode, 512 * 1024)
             : lt_switch_file(session, id, episode, 512 * 1024);
         require(sid >= 0, lt_last_error());
+        require(lt_check_stream_start(session, sid) == 0, "empty episode reported startup ready");
         auto handle = sw->handles.at(id);
         const int first_piece = int(episode * content.size() / piece_length);
         const int last_piece = int(((episode + 1) * content.size() - 1) / piece_length);
         const int wanted_pieces = last_piece - first_piece + 1;
         if (episode > 0) {
+            require(lt_check_stream_start(session, previous) == -1, "replaced stream remains startup-valid");
             require(!previous_handle.is_valid(), "old episode still has a live BT handle");
             require(sw->streams.size() == 1, "switchFile left concurrent old streams running");
             lt_stream_status stopped{};
@@ -453,10 +544,19 @@ static void test_current_episode(lt_session_t session, const std::filesystem::pa
             require(sw->streams.count(sid), "stale stop deleted the new episode");
         }
         require(lt_get_file_count(session, id) == 10, "switch lost collection metadata");
+        const auto startup_demand = sw->streams.at(sid)->scheduler->demand(first_piece);
+        require(startup_demand.priority == 7 && startup_demand.deadline <= chr::steady_clock::now(),
+                "new episode first piece lacks immediate startup priority/deadline");
+        handle.add_piece(lt::piece_index_t(last_piece), content.data());
+        wait_until([&] { return handle.have_piece(lt::piece_index_t(last_piece)); }, "tail fixture did not verify");
+        require(lt_check_stream_start(session, sid) == 0, "tail completion incorrectly satisfied startup wait");
         for (int piece = first_piece; piece <= last_piece; ++piece)
             handle.add_piece(lt::piece_index_t(piece), content.data());
         wait_until([&] { return handle.status(lt::torrent_handle::query_pieces).pieces.count() == wanted_pieces; },
                    "current episode data did not verify");
+        wait_until([&] { return lt_check_stream_start(session, sid) == 1; }, "verified first piece was not readable");
+        require(lt_check_stream_start(session, sid) == 1, "repeat startup check consumed readiness");
+        require(sw->streams.at(sid)->read_head == 0, "startup wait advanced the HTTP cursor");
         auto status = handle.status(lt::torrent_handle::query_pieces);
         for (int piece = 0; piece < total_pieces; ++piece) {
             require(status.pieces[lt::piece_index_t(piece)] == (piece >= first_piece && piece <= last_piece),
@@ -471,6 +571,40 @@ static void test_current_episode(lt_session_t session, const std::filesystem::pa
         if (episode == 0 || episode == 9)
             test_local_upload(sw, id, torrent_path, folder / ("peer-" + std::to_string(episode)));
         if (episode == 0) {
+            // Both add entry points must resolve to one lifecycle owner, even
+            // when a caller changes the URI's trackers or requested save path.
+            const auto task_count = sw->handles.size();
+            const auto handle_before_add = sw->handles.at(id);
+            const auto magnet = lt::make_magnet_uri(handle_before_add);
+            const auto other_path = (folder / "unused-cache").string();
+            lt_torrent_id concurrent_file_id = -1;
+            lt_torrent_id concurrent_magnet_id = -1;
+            std::thread file_add([&] {
+                concurrent_file_id = lt_add_torrent_file(session, torrent_path.string().c_str(), other_path.c_str(), 1);
+            });
+            std::thread magnet_add([&] {
+                concurrent_magnet_id = lt_add_magnet(session, magnet.c_str(), other_path.c_str(), 1);
+            });
+            file_add.join();
+            magnet_add.join();
+            require(concurrent_file_id == id && concurrent_magnet_id == id,
+                    "concurrent duplicate adds allocated another task ID");
+            require(lt_add_torrent_file(session, torrent_path.string().c_str(), other_path.c_str(), 1) == id,
+                    "duplicate torrent file allocated another task ID");
+            require(lt_add_magnet(session, magnet.c_str(), other_path.c_str(), 1) == id,
+                    "duplicate magnet allocated another task ID");
+            require(lt_add_torrent_file(session, torrent_path.string().c_str(), save_path.string().c_str(), 0) < 0,
+                    "duplicate torrent file changed on-demand mode");
+            require(lt_add_magnet(session, magnet.c_str(), save_path.string().c_str(), 0) < 0,
+                    "duplicate magnet changed on-demand mode");
+            require(std::string(lt_last_error()).find("streamOnly") != std::string::npos,
+                    "conflicting duplicate omitted its mode mismatch");
+            require(sw->handles.size() == task_count && sw->handles.at(id) == handle_before_add,
+                    "duplicate registration changed the task owner");
+            require(sw->stream_only_torrents.count(id) && sw->streams.count(sid),
+                    "duplicate registration changed the stream lifecycle");
+            require(fs::path(handle_before_add.status().save_path) == save_path,
+                    "duplicate registration moved existing data");
             require(lt_start_stream(session, id, 99, 0) < 0, "invalid episode accepted");
             require(lt_switch_file(session, id, 99, 0) < 0, "switch accepted an invalid episode");
             require(lt_switch_file(session, id, -1, 0) < 0, "switch silently auto-selected an episode");
@@ -506,6 +640,7 @@ static void test_current_episode(lt_session_t session, const std::filesystem::pa
 
     // Explicit stop-before-start also clears payload but retains the same ID.
     lt_stop_stream_ex(session, previous, 1);
+    require(lt_check_stream_start(session, previous) == -1, "stopped stream remains startup-valid");
     require(std::string(lt_last_error()).empty(), "metadata-only stop failed");
     require(!previous_handle.is_valid(), "stopped episode can still upload");
     require(sw->streams.empty() && lt_get_file_count(session, id) == 10, "metadata-only retention lost task");
@@ -536,6 +671,7 @@ static void test_current_episode(lt_session_t session, const std::filesystem::pa
     }
 #endif
     lt_remove_torrent(session, id, 1);
+    require(lt_check_stream_start(session, restarted) == -1, "removed stream remains startup-valid");
     require(!sw->handles.count(id) && sw->streams.empty(), "final collection cleanup left a task");
 }
 
@@ -640,6 +776,7 @@ static void test_local_stream() {
         lt_remove_torrent(session, id, 1);
 
         // streamOnly controls selection, while both modes share stop policy.
+        test_switch_reconnect(session, torrent_path, folder);
         test_stream_lifecycle(session, torrent_path, folder / "empty");
         auto cleanup_id = lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 0);
         auto cleanup_stream = lt_start_stream(session, cleanup_id, 0, 1024 * 1024);

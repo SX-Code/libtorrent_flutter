@@ -216,6 +216,9 @@ typedef LtStartStream = int Function(Pointer<LtSessionOpaque>, int, int, int);
 typedef _StopStreamN = Void Function(Pointer<LtSessionOpaque>, Int64, Int32);
 typedef LtStopStream = void Function(Pointer<LtSessionOpaque>, int, int);
 
+typedef _CheckStreamStartN = Int32 Function(Pointer<LtSessionOpaque>, Int64);
+typedef LtCheckStreamStart = int Function(Pointer<LtSessionOpaque>, int);
+
 typedef _GetStreamStatusN =
     Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<LtStreamStatus>);
 typedef LtGetStreamStatus =
@@ -352,6 +355,7 @@ class TorrentBridgeBindings {
   late final LtStartStream startStream;
   late final LtStartStream switchFile;
   late final LtStopStream stopStream;
+  late final LtCheckStreamStart checkStreamStart;
   late final LtGetStreamStatus getStreamStatus;
   late final LtGetAllStreamStatuses getAllStreamStatuses;
   late final LtSetDownloadLimit setDownloadLimit;
@@ -423,6 +427,9 @@ class TorrentBridgeBindings {
     stopStream = _lib
         .lookup<NativeFunction<_StopStreamN>>('lt_stop_stream_ex')
         .asFunction<LtStopStream>();
+    checkStreamStart = _lib
+        .lookup<NativeFunction<_CheckStreamStartN>>('lt_check_stream_start')
+        .asFunction<LtCheckStreamStart>();
     getStreamStatus = _lib
         .lookup<NativeFunction<_GetStreamStatusN>>('lt_get_stream_status')
         .asFunction<LtGetStreamStatus>();

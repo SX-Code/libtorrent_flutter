@@ -222,7 +222,20 @@ static void fill_status(lt_torrent_status& out, int64_t id,
                         const lt::torrent_status& st)
 {
     out.id    = id;
-    out.state = static_cast<int32_t>(st.state);
+    // The public C/Dart enum is not libtorrent's enum: libtorrent reserves
+    // value 0 and uses 1..7. Translate explicitly across the ABI boundary.
+    switch (st.state) {
+        case lt::torrent_status::checking_files: out.state = LT_STATE_CHECKING_FILES; break;
+        case lt::torrent_status::downloading_metadata: out.state = LT_STATE_DOWNLOADING_META; break;
+        case lt::torrent_status::downloading: out.state = LT_STATE_DOWNLOADING; break;
+        case lt::torrent_status::finished: out.state = LT_STATE_FINISHED; break;
+        case lt::torrent_status::seeding: out.state = LT_STATE_SEEDING; break;
+#if TORRENT_ABI_VERSION == 1
+        case lt::torrent_status::allocating: out.state = LT_STATE_ALLOCATING; break;
+#endif
+        case lt::torrent_status::checking_resume_data: out.state = LT_STATE_CHECKING_RESUME; break;
+        default: out.state = LT_STATE_UNKNOWN; break;
+    }
 
     if ((st.state == lt::torrent_status::finished ||
          st.state == lt::torrent_status::seeding) && st.progress < 0.999f)
@@ -1064,6 +1077,10 @@ struct StreamEngine {
     std::mutex              read_mu;
     std::condition_variable read_cv;
     std::unordered_map<int, ReadResult> read_results;
+    // Guarded by SessionWrapper::streams_mu. Startup probes schedule disk I/O
+    // asynchronously and share a throttle across all Dart waiters.
+    chr::steady_clock::time_point next_start_read{};
+    std::atomic<bool> start_piece_readable{false};
 
     // preload state — port of torrent.go PreloadSize/PreloadedBytes
     std::atomic<int64_t> preload_size{0};
@@ -1299,6 +1316,7 @@ struct StreamEngine {
         if (ok && data && size > 0) {
             safe_copy.assign(data, data + size);
         }
+        if (p == start_piece) start_piece_readable = !safe_copy.empty();
 
         // Store result for read_piece_data() consumers
         {
@@ -1337,6 +1355,7 @@ struct StreamEngine {
     }
 
     void on_hash_failed(int p) {
+        if (p == start_piece) start_piece_readable = false;
         {
             std::lock_guard<std::mutex> lk(piece_mu);
             pieces_have.erase(p);
@@ -1377,6 +1396,8 @@ struct SessionWrapper {
     std::mutex mu;
     std::unordered_map<int64_t, lt::torrent_handle> handles;
     std::unordered_set<int64_t> stream_only_torrents;
+    // Lifecycle-owned, bounded endpoint hints only; never retain old have-bits.
+    std::unordered_map<lt_torrent_id, std::vector<lt::tcp::endpoint>> reconnect_peers;
     // Protected by mu, including completion fields written by the alert thread.
     std::unordered_map<lt_torrent_id, std::shared_ptr<TorrentReset>> resets;
     std::condition_variable reset_cv;
@@ -1676,7 +1697,35 @@ static void remove_torrent_internal(SessionWrapper* sw, lt_torrent_id tid, bool 
         sw->resets.erase(tid);
     }
     sw->needs_reset.erase(tid);
+    sw->reconnect_peers.erase(tid);
     sw->removing_torrents.erase(tid);
+}
+
+// Caller holds lifecycle_mu. An incoming connection's remote port may be
+// ephemeral, so retain only outgoing BitTorrent endpoints, preferring seeds.
+static void remember_stream_peers(SessionWrapper* sw, lt_torrent_id tid,
+                                  const lt::torrent_handle& handle) {
+    std::vector<lt::peer_info> connected;
+    handle.get_peer_info(connected);
+    std::stable_sort(connected.begin(), connected.end(), [](const auto& a, const auto& b) {
+        const bool a_seed = bool(a.flags & lt::peer_info::seed);
+        const bool b_seed = bool(b.flags & lt::peer_info::seed);
+        return a_seed != b_seed ? a_seed : a.payload_down_speed > b.payload_down_speed;
+    });
+    std::vector<lt::tcp::endpoint> endpoints;
+    const auto append = [&](const lt::tcp::endpoint& endpoint) {
+        if (endpoints.size() < 64 && endpoint.port() != 0 && !endpoint.address().is_unspecified()
+            && std::find(endpoints.begin(), endpoints.end(), endpoint) == endpoints.end())
+            endpoints.push_back(endpoint);
+    };
+    for (const auto& peer : connected) {
+        if ((peer.flags & lt::peer_info::outgoing_connection)
+            && !(peer.connection_type & (lt::peer_info::web_seed | lt::peer_info::http_seed)))
+            append(peer.ip);
+    }
+    // Rapid switches may occur before a connection completes. Keep prior hints.
+    for (const auto& endpoint : sw->reconnect_peers[tid]) append(endpoint);
+    sw->reconnect_peers[tid] = std::move(endpoints);
 }
 
 // Caller holds lifecycle_mu. Explicit replacement stops every stream of this torrent.
@@ -1720,6 +1769,8 @@ static bool reset_stream_data(SessionWrapper* sw, lt_torrent_id tid) {
         reset->params.max_uploads = handle.max_uploads();
         reset->params.upload_limit = handle.upload_limit();
         reset->params.download_limit = handle.download_limit();
+        remember_stream_peers(sw, tid, handle);
+        reset->params.peers = sw->reconnect_peers[tid];
         for (const auto& tracker : handle.trackers()) {
             reset->params.trackers.push_back(tracker.url);
             reset->params.tracker_tiers.push_back(tracker.tier);
@@ -1985,6 +2036,10 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
         s->extend_window(*reader, p);
 
         if (!have_it) {
+            // Container probes and player buffering can outrun the estimated
+            // playback rate. A piece blocking this read is urgent now, even
+            // if this reader already scheduled it with a later deadline.
+            if (s->scheduler) s->scheduler->request(s->id, p, 7, 0, reader->reader_id);
             s->update_http_reader(reader->reader_id, cursor, true);
             TB_LOG("HTTP wait stream=%lld reader=%d piece=%d", (long long)s->id, reader->reader_id, p);
             if (!wait_for_http_piece(s, p, cli)) return false;
@@ -2631,6 +2686,30 @@ TORRENT_API void lt_poll_alerts(lt_session_t session,
 
 // ── torrent management ──────────────────────────────────────────────────────────
 
+// Caller holds lifecycle_mu and mu. libtorrent returns the existing handle
+// for a duplicate info-hash. It must keep one ID/scheduler/cleanup owner here
+// too; a second ID would make switchFile unsafe and misroute piece alerts.
+static lt_torrent_id register_torrent(SessionWrapper* sw, const lt::torrent_handle& handle,
+                                      bool stream_only) {
+    for (const auto& entry : sw->handles) {
+        if (entry.second != handle) continue;
+        if ((sw->stream_only_torrents.count(entry.first) != 0) != stream_only) {
+            set_err("torrent already exists as torrentId=" + std::to_string(entry.first)
+                + " with a different streamOnly mode; reuse that task or remove it before changing mode");
+            return -1;
+        }
+        // Retain the existing save path, pause state and stream demands.
+        set_err("");
+        return entry.first;
+    }
+    handle.resume();
+    const auto id = sw->next_id.fetch_add(1);
+    sw->handles[id] = handle;
+    if (stream_only) sw->stream_only_torrents.insert(id);
+    set_err("");
+    return id;
+}
+
 TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
                                         const char* uri, const char* path,
                                         int stream_only) {
@@ -2673,12 +2752,7 @@ TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
         std::lock_guard<std::mutex> registration_lock(sw->mu);
         lt::torrent_handle h = sw->session.add_torrent(std::move(atp), ec);
         if (ec) { set_err(ec.message()); return -1; }
-        h.resume();
-
-        int64_t id = sw->next_id.fetch_add(1);
-        sw->handles[id] = h;
-        if (stream_only) sw->stream_only_torrents.insert(id);
-        set_err(""); return id;
+        return register_torrent(sw, h, stream_only != 0);
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
 }
 
@@ -2707,12 +2781,7 @@ TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
         std::lock_guard<std::mutex> registration_lock(sw->mu);
         lt::torrent_handle h = sw->session.add_torrent(std::move(atp), ec);
         if (ec) { set_err(ec.message()); return -1; }
-        h.resume();
-
-        int64_t id = sw->next_id.fetch_add(1);
-        sw->handles[id] = h;
-        if (stream_only) sw->stream_only_torrents.insert(id);
-        set_err(""); return id;
+        return register_torrent(sw, h, stream_only != 0);
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
 }
 
@@ -3164,6 +3233,31 @@ static void fill_stream_status(lt_stream_status* out, const StreamEngine* s) {
     std::string url = s->make_url();
     std::strncpy(out->url, url.c_str(), sizeof(out->url) - 1);
     out->url[sizeof(out->url) - 1] = 0;
+}
+
+TORRENT_API int lt_check_stream_start(lt_session_t session, lt_stream_id sid) {
+    if (!session) return -1;
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lock(sw->streams_mu);
+    auto it = sw->streams.find(sid);
+    if (it == sw->streams.end()) return -1;
+    auto& stream = *it->second;
+    if (!stream.active || !stream.running || !stream.handle.is_valid()) return -1;
+    try {
+        // Use the selected file's first torrent piece, never read_head (which
+        // can follow an independent player probe at a different position).
+        if (!stream.handle.have_piece(lt::piece_index_t(stream.start_piece))) return 0;
+        if (stream.start_piece_readable || stream.has_cached_piece(stream.start_piece)) return 1;
+        const auto now = chr::steady_clock::now();
+        if (now >= stream.next_start_read) {
+            stream.next_start_read = now + chr::seconds(1);
+            stream.handle.read_piece(lt::piece_index_t(stream.start_piece));
+        }
+        return 0; // read_piece_alert confirms successful I/O on a later probe
+    } catch (const std::exception& error) {
+        set_err(error.what());
+        return -2;
+    }
 }
 
 TORRENT_API int lt_get_stream_status(lt_session_t session,

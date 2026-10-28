@@ -13,6 +13,18 @@ enum TorrentState {
   checkingResume,
 }
 
+/// Outcome of waiting for a stream's first piece, independent of player state.
+enum StreamStartResult {
+  /// The first piece of the selected file has been verified and read successfully.
+  ready,
+
+  /// Only this wait expired. The stream remains valid and can be waited on again.
+  timeout,
+
+  /// The stream was stopped/replaced/removed, or its engine was disposed.
+  invalid,
+}
+
 /// Stream playback state.
 enum StreamState {
   idle,

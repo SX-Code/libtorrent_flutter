@@ -1,7 +1,17 @@
 # Changelog
 
+[English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
+
+Historical entries describe their respective releases; see [README](README.md) for current behavior.
+
 ## 2.0.1-dev.1 (unreleased)
 
+- Temporarily limit GitHub Actions to iOS builds during debugging; other platform jobs remain available but disabled.
+- Add `waitForStreamStart` with `StreamStartResult.ready/timeout/invalid`. Independently timed asynchronous waits check the selected file's first verified/readable piece; timeout retains the stream and permits retry, while stop/switch/removal/disposal invalidate old waits. Requires the new native `lt_check_stream_start` export.
+- Preserve up to 64 outgoing peer endpoint hints across episode cleanup, prioritizing seeds and retaining hints during rapid switches. Rebuilt torrents can reconnect without waiting for peer discovery; old payload/have-bits are still cleared.
+- Translate libtorrent states explicitly to the public C/Dart enum; downloading was incorrectly labeled Finished, and completion of selected pieces was mislabeled Seeding.
+- Reuse the existing torrent ID when duplicate magnets or torrent files resolve to the same native handle. Preserve the original save path/state and reject conflicting `streamOnly` modes, preventing duplicate task aliases from blocking episode cleanup in `switchFile`.
+- Promote a missing piece blocking an HTTP read to an immediate deadline, even if it was already prefetched with a later playback deadline. This restores urgency when container probes or player buffering advance faster than the estimated playback rate.
 - Fix startup Range probes cancelling one another: each HTTP GET owns an independently merged download window and deadlines. Disconnects withdraw only their own demands; HEAD never changes playback state or scheduling. Range offsets no longer imply a user seek; status follows the first active GET.
 - Add opt-in HTTP Range/wait/completion diagnostics via `TB_LOG_FILE=stderr` or a writable file path. Native regression coverage includes HEAD isolation, concurrent probes, shared-piece delivery and disconnect/removal cleanup.
 - Add `stopStream(..., keepTorrent: false)` and the same option to `stopAllStreamsForTorrent`. The last stream deletes its task/files by default in both modes.

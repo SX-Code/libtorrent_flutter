@@ -125,6 +125,7 @@ class LibtorrentFlutter {
   final _torrentsCtrl = StreamController<Map<int, TorrentInfo>>.broadcast();
   final Map<int, TorrentInfo> _torrents = {};
   Timer? _pollTimer;
+  bool _disposed = false;
 
   // Stream status
   final _streamsCtrl = StreamController<Map<int, StreamInfo>>.broadcast();
@@ -270,6 +271,9 @@ class LibtorrentFlutter {
   /// Multiple files can stream concurrently. Use [switchFile] when changing
   /// episodes to clear old disk data while retaining the torrent ID/metadata.
   /// Stopping the last stream with keepTorrent: true retains metadata only.
+  /// Adding the same torrent again returns its existing ID, preserving its
+  /// save path and state. A different [streamOnly] mode throws. The returned
+  /// ID is shared, not a separate task or reference-counted ownership token.
   int addMagnet(String magnetUri, [String? savePath, bool streamOnly = false]) {
     final enhanced = TrackerManager.injectTrackers(magnetUri);
     final m = enhanced.toNativeUtf8();
@@ -285,6 +289,8 @@ class LibtorrentFlutter {
   }
 
   /// Add a torrent from a .torrent file path.
+  /// Duplicate torrents follow [addMagnet]'s ID reuse and mode-conflict rules,
+  /// including torrents originally added from a magnet URI.
   int addTorrentFile(
     String filePath, [
     String? savePath,
@@ -397,6 +403,43 @@ class LibtorrentFlutter {
       maxCacheBytes,
     );
     return _registerStream(torrentId, streamId, 'switchFile');
+  }
+
+  /// Wait for the selected file's first piece to be verified and readable.
+  ///
+  /// This does not wait for container parsing or decoded video. Timeout only
+  /// ends this wait: the same stream ID/URL and background downloads survive.
+  /// Multiple waits are independent. A stopped/replaced/removed stream or a
+  /// disposed engine returns [StreamStartResult.invalid], including mid-wait.
+  /// Zero timeout checks once; negative timeouts throw [ArgumentError].
+  Future<StreamStartResult> waitForStreamStart(
+    int streamId, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    if (timeout.isNegative) {
+      throw ArgumentError.value(timeout, 'timeout', 'must not be negative');
+    }
+    final watch = Stopwatch()..start();
+    while (true) {
+      // Never pass a destroyed session pointer to FFI, even if a new engine
+      // has since been initialized and reuses the same numeric stream IDs.
+      if (_disposed) return StreamStartResult.invalid;
+      final state = _b.checkStreamStart(_session, streamId);
+      if (state == -1) return StreamStartResult.invalid;
+      if (state == 1) return StreamStartResult.ready;
+      if (state != 0) {
+        throw StateError(
+          'waitForStreamStart failed: ${_b.lastError().toDartString()}',
+        );
+      }
+      final remaining = timeout - watch.elapsed;
+      if (remaining <= Duration.zero) return StreamStartResult.timeout;
+      await Future<void>.delayed(
+        remaining < const Duration(milliseconds: 100)
+            ? remaining
+            : const Duration(milliseconds: 100),
+      );
+    }
   }
 
   StreamInfo _registerStream(int torrentId, int streamId, String operation) {
@@ -709,8 +752,10 @@ class LibtorrentFlutter {
   /// destroys the native session. After this, you'd need to call
   /// [init] again to use the engine.
   Future<void> dispose() async {
+    if (_disposed) return;
     disposeAll();
     _pollTimer?.cancel();
+    _disposed = true;
     _b.destroySession(_session);
     await _torrentsCtrl.close();
     await _streamsCtrl.close();
