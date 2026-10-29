@@ -149,6 +149,26 @@ class TorrentInfo {
       'progress=${(progress * 100).toStringAsFixed(1)}%)';
 }
 
+/// A file selected for full download in the current engine session.
+/// Completion counts verified pieces, including shared boundary pieces.
+class FileDownloadInfo {
+  final int fileIndex;
+  final int fileSize;
+  final int verifiedBytes;
+  final int priority;
+  final bool isComplete;
+
+  const FileDownloadInfo({
+    required this.fileIndex,
+    required this.fileSize,
+    required this.verifiedBytes,
+    required this.priority,
+    required this.isComplete,
+  });
+
+  double get progress => fileSize == 0 ? 1.0 : verifiedBytes / fileSize;
+}
+
 /// Information about a file within a torrent.
 class FileInfo {
   final int index;

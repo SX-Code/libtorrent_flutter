@@ -38,6 +38,10 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/read_resume_data.hpp>
+#include <libtorrent/write_resume_data.hpp>
+#include <libtorrent/bencode.hpp>
+#include <libtorrent/bdecode.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/version.hpp>
 #include <libtorrent/file_storage.hpp>
@@ -859,21 +863,51 @@ struct PieceDemand {
 
 class StreamScheduler {
 public:
-    explicit StreamScheduler(lt::torrent_handle handle) : handle_(handle) {}
+    explicit StreamScheduler(lt::torrent_handle handle, bool ordinary_download = false) : handle_(handle) {
+        const auto ti = handle_.torrent_file();
+        file_priorities_.assign(size_t(ti->num_files()), lt::dont_download);
+        if (ordinary_download) {
+            file_priorities_ = handle_.get_file_priorities();
+            file_priorities_.resize(size_t(ti->num_files()), lt::default_priority);
+        }
+        rebuild_base_locked();
+    }
+
+    // A file selection owns a baseline independently of HTTP readers/streams.
+    void download_file(int index) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& priority = file_priorities_.at(size_t(index));
+        if (priority >= lt::default_priority) return;
+        priority = lt::default_priority;
+        rebuild_base_locked();
+        // Materialize selected files instead of leaving their bytes in partfile.
+        // file_prio_alert reapplies the aggregate after this async disk operation.
+        handle_.prioritize_files(file_priorities_);
+        reapply_locked();
+    }
+
+    void select_files(const std::vector<lt::download_priority_t>& priorities) {
+        std::lock_guard<std::mutex> lock(mu_);
+        file_priorities_ = priorities;
+        rebuild_base_locked();
+        handle_.prioritize_files(file_priorities_);
+        reapply_locked();
+    }
+
+    std::vector<lt::download_priority_t> download_priorities() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return file_priorities_;
+    }
+
+    bool has_downloads() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return std::any_of(file_priorities_.begin(), file_priorities_.end(),
+            [](auto priority) { return priority != lt::dont_download; });
+    }
 
     void add_stream(lt_stream_id id) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (!initialized_) {
-            auto ti = handle_.torrent_file();
-            auto status = handle_.status(lt::torrent_handle::query_pieces);
-            std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> priorities;
-            for (int p = 0; ti && p < ti->num_pieces(); ++p) {
-                if (p < status.pieces.size() && status.pieces[lt::piece_index_t(p)]) continue;
-                priorities.emplace_back(lt::piece_index_t(p), lt::dont_download);
-            }
-            handle_.prioritize_pieces(priorities);
-            initialized_ = true;
-        }
+        if (!initialized_) reapply_locked();
         demands_.emplace(std::make_pair(id, 0), std::unordered_map<int, PieceDemand>{});
     }
 
@@ -942,6 +976,12 @@ public:
     // before streaming completes later, restore the active streams' aggregate.
     void reapply() {
         std::lock_guard<std::mutex> lock(mu_);
+        reapply_locked();
+    }
+
+private:
+    void reapply_locked() {
+        initialized_ = true;
         auto ti = handle_.torrent_file();
         auto status = handle_.status(lt::torrent_handle::query_pieces);
         std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> priorities;
@@ -956,12 +996,15 @@ public:
         for (int piece : pieces) apply_locked(piece);
     }
 
+public:
     void shutdown() {
         std::lock_guard<std::mutex> lock(mu_);
         std::unordered_set<int> pieces;
         for (const auto& owner : demands_)
             for (const auto& entry : owner.second) pieces.insert(entry.first);
         demands_.clear(); // late worker updates can no longer find an owner
+        file_priorities_.assign(file_priorities_.size(), lt::dont_download);
+        base_priorities_.assign(base_priorities_.size(), 0);
         for (int piece : pieces) apply_locked(piece);
     }
 
@@ -977,8 +1020,27 @@ public:
     }
 
 private:
+    void rebuild_base_locked() {
+        const auto ti = handle_.torrent_file();
+        const auto& files = ti->files();
+        base_priorities_.assign(size_t(ti->num_pieces()), 0);
+        for (int file = 0; file < files.num_files(); ++file) {
+            const auto index = lt::file_index_t(file);
+            if (files.pad_file_at(index)) { file_priorities_[file] = lt::dont_download; continue; }
+            const int priority = static_cast<std::uint8_t>(file_priorities_[file]);
+            const auto size = files.file_size(index);
+            if (!priority || size <= 0) continue;
+            const auto offset = files.file_offset(index);
+            const int first = int(offset / ti->piece_length());
+            const int last = int((offset + size - 1) / ti->piece_length());
+            for (int piece = first; piece <= last; ++piece)
+                base_priorities_[piece] = std::max(base_priorities_[piece], priority);
+        }
+    }
+
     PieceDemand merged_locked(int piece) const {
         PieceDemand merged;
+        if (piece >= 0 && size_t(piece) < base_priorities_.size()) merged.priority = base_priorities_[piece];
         for (const auto& owner : demands_) {
             auto it = owner.second.find(piece);
             if (it == owner.second.end()) continue;
@@ -1010,6 +1072,8 @@ private:
     std::mutex mu_;
     lt::torrent_handle handle_;
     bool initialized_ = false;
+    std::vector<lt::download_priority_t> file_priorities_;
+    std::vector<int> base_priorities_;
     // Reader 0 owns startup/preload requests. Positive IDs own HTTP GETs.
     std::map<std::pair<lt_stream_id, int>, std::unordered_map<int, PieceDemand>> demands_;
 };
@@ -1380,29 +1444,22 @@ std::atomic<int32_t> StreamEngine::active_streams{0};
 struct SessionWrapper;
 static void run_http_server(SessionWrapper* sw, StreamEngine* stream);
 
-// A reset retains metadata while libtorrent closes storage and deletes both
-// payload files and its partfile. Never reuse the save path before this alert.
-struct TorrentReset {
-    lt::add_torrent_params params;
-    lt::torrent_handle previous;
-    bool done = false;
-    lt::error_code error;
+// ── session wrapper ─────────────────────────────────────────────────────────────
+struct ResumeRequest {
+    lt::torrent_handle handle;
+    std::vector<lt::download_priority_t> selection;
+    bool stream_only = false;
+    bool pending = true;
+    std::vector<char> bytes;
+    std::string error;
 };
 
-// ── session wrapper ─────────────────────────────────────────────────────────────
 struct SessionWrapper {
     lt::session session;
 
     std::mutex mu;
     std::unordered_map<int64_t, lt::torrent_handle> handles;
     std::unordered_set<int64_t> stream_only_torrents;
-    // Lifecycle-owned, bounded endpoint hints only; never retain old have-bits.
-    std::unordered_map<lt_torrent_id, std::vector<lt::tcp::endpoint>> reconnect_peers;
-    // Protected by mu, including completion fields written by the alert thread.
-    std::unordered_map<lt_torrent_id, std::shared_ptr<TorrentReset>> resets;
-    std::condition_variable reset_cv;
-    // Protected by lifecycle_mu. Failed deletion must succeed before playback.
-    std::unordered_set<lt_torrent_id> needs_reset;
     std::atomic<int64_t> next_id{1};
 
     // Serializes public start/stop/remove through thread teardown. Alert and
@@ -1416,6 +1473,32 @@ struct SessionWrapper {
     std::unordered_map<lt_torrent_id, std::shared_ptr<StreamScheduler>> schedulers;
     std::unordered_map<int64_t, std::unique_ptr<StreamEngine>> streams;
     std::atomic<int64_t> next_stream_id{1};
+
+    // Resume callbacks never acquire lifecycle_mu: stream teardown may be joining
+    // readers which need this same alert thread to finish their disk reads.
+    std::mutex resume_mu;
+    std::unordered_map<lt_torrent_id, ResumeRequest> resume_requests;
+
+    void receive_resume(const lt::torrent_handle& handle,
+                        const lt::add_torrent_params* params, const std::string& error) {
+        std::lock_guard<std::mutex> lock(resume_mu);
+        for (auto& item : resume_requests) {
+            auto& request = item.second;
+            if (!request.pending || request.handle != handle) continue;
+            try {
+                if (!params) throw std::runtime_error(error);
+                auto saved = *params;
+                saved.file_priorities = request.selection;
+                saved.piece_priorities.clear(); // never persist playback windows
+                saved.flags &= ~lt::torrent_flags::stop_when_ready;
+                auto entry = lt::write_resume_data(saved);
+                entry["ltf-version"] = 1;
+                entry["ltf-stream-only"] = request.stream_only ? 1 : 0;
+                lt::bencode(std::back_inserter(request.bytes), entry);
+            } catch (const std::exception& e) { request.error = e.what(); }
+            request.pending = false;
+        }
+    }
 
     // alert thread — sole consumer of session.pop_alerts()
     std::thread       alert_thread;
@@ -1463,42 +1546,11 @@ struct SessionWrapper {
         return -1;
     }
 
-    void complete_reset(const lt::torrent_handle& previous, lt::error_code error) {
-        std::lock_guard<std::mutex> lock(mu);
-        for (auto& entry : resets) {
-            if (entry.second->previous != previous) continue;
-            entry.second->error = error;
-            entry.second->done = true;
-        }
-        reset_cv.notify_all();
-    }
-
-    // Caller holds mu. Metadata remains queryable even if a reset times out.
+    // Caller holds mu.
     std::shared_ptr<const lt::torrent_info> metadata(lt_torrent_id id) {
-        auto reset = resets.find(id);
-        if (reset != resets.end()) return reset->second->params.ti;
         auto handle = handles.find(id);
         return handle != handles.end() && handle->second.is_valid()
             ? handle->second.torrent_file() : nullptr;
-    }
-
-    // Caller holds mu. A pending reset is a retained, non-transferring task.
-    bool reset_status(lt_torrent_id id, lt_torrent_status& out) {
-        auto it = resets.find(id);
-        if (it == resets.end()) return false;
-        const auto& reset = *it->second;
-        out = {};
-        out.id = id;
-        out.state = LT_STATE_CHECKING_FILES;
-        out.has_metadata = 1;
-        out.is_paused = 1;
-        out.num_pieces = reset.params.ti->num_pieces();
-        out.queue_position = -1;
-        std::strncpy(out.name, reset.params.ti->name().c_str(), sizeof(out.name) - 1);
-        std::strncpy(out.save_path, reset.params.save_path.c_str(), sizeof(out.save_path) - 1);
-        const auto message = reset.error ? reset.error.message() : "Clearing previous episode data";
-        std::strncpy(out.error_msg, message.c_str(), sizeof(out.error_msg) - 1);
-        return true;
     }
 
     void start_alert_thread() {
@@ -1517,11 +1569,13 @@ struct SessionWrapper {
                 for (auto* a : alerts) {
                     if (!a) continue;
                     try {
-                        // Complete storage cleanup independently of stream delivery.
-                        if (auto* deleted = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
-                            complete_reset(deleted->handle, {});
-                        } else if (auto* failed = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
-                            complete_reset(failed->handle, failed->error);
+                        if (auto* saved = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+                            receive_resume(saved->handle, &saved->params, "");
+                            continue;
+                        }
+                        if (auto* failed = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+                            receive_resume(failed->handle, nullptr, failed->error.message());
+                            continue;
                         }
                         // read_piece_alert → route to stream's cache
                         if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) {
@@ -1555,6 +1609,8 @@ struct SessionWrapper {
                         else if (auto* hf = lt::alert_cast<lt::hash_failed_alert>(a)) {
                             int p = static_cast<int>(hf->piece_index);
                             std::lock_guard<std::mutex> slk(streams_mu);
+                            for (auto& entry : schedulers)
+                                if (entry.second->owns(hf->handle)) entry.second->refresh(p);
                             for (auto& kv : streams) {
                                 auto& s = kv.second;
                                 if (!s->active || s->handle != hf->handle) continue;
@@ -1583,12 +1639,11 @@ struct SessionWrapper {
                                 std::lock_guard<std::mutex> lk(mu);
                                 is_stream_only = stream_only_torrents.count(mid) > 0;
                             }
-                            // A stream that already started owns the priorities.
                             std::lock_guard<std::mutex> slk(streams_mu);
-                            if (is_stream_only) {
-                                for (auto& kv : streams)
-                                    if (kv.second->active && kv.second->handle == mra->handle)
-                                        is_stream_only = false;
+                            auto scheduler = schedulers.find(mid);
+                            if (scheduler != schedulers.end()) {
+                                scheduler->second->reapply();
+                                is_stream_only = false;
                             }
                             if (is_stream_only) {
                                 try {
@@ -1639,6 +1694,20 @@ static SessionWrapper* to_sw(lt_session_t h) {
     return reinterpret_cast<SessionWrapper*>(h);
 }
 
+// Caller holds lifecycle_mu; map changes also synchronize with alert delivery.
+static std::shared_ptr<StreamScheduler> download_scheduler(SessionWrapper* sw, lt_torrent_id tid) {
+    std::lock_guard<std::mutex> streams_lock(sw->streams_mu);
+    std::lock_guard<std::mutex> lock(sw->mu);
+    auto found = sw->handles.find(tid);
+    if (found == sw->handles.end() || !found->second.is_valid())
+        throw std::runtime_error("torrent not found");
+    if (!found->second.torrent_file()) throw std::runtime_error("torrent metadata is not ready");
+    auto& scheduler = sw->schedulers[tid];
+    if (!scheduler) scheduler = std::make_shared<StreamScheduler>(found->second,
+        !sw->stream_only_torrents.count(tid));
+    return scheduler;
+}
+
 // Caller holds lifecycle_mu. This path never removes the torrent, and is
 // shared by explicit stop, failed startup and whole-torrent removal.
 static lt_torrent_id stop_stream_internal(SessionWrapper* sw, lt_stream_id sid) {
@@ -1673,6 +1742,10 @@ static lt_torrent_id stop_stream_internal(SessionWrapper* sw, lt_stream_id sid) 
 // Caller holds lifecycle_mu. Workers never invoke this function, so deleting
 // an entire torrent cannot recurse through public stopStream cleanup policy.
 static void remove_torrent_internal(SessionWrapper* sw, lt_torrent_id tid, bool delete_files) {
+    {
+        std::lock_guard<std::mutex> lock(sw->resume_mu);
+        sw->resume_requests.erase(tid);
+    }
     sw->removing_torrents.insert(tid);
     auto scheduler = sw->schedulers.find(tid);
     if (scheduler != sw->schedulers.end()) scheduler->second->shutdown();
@@ -1694,131 +1767,8 @@ static void remove_torrent_internal(SessionWrapper* sw, lt_torrent_id tid, bool 
             sw->handles.erase(it);
         }
         sw->stream_only_torrents.erase(tid);
-        sw->resets.erase(tid);
     }
-    sw->needs_reset.erase(tid);
-    sw->reconnect_peers.erase(tid);
     sw->removing_torrents.erase(tid);
-}
-
-// Caller holds lifecycle_mu. An incoming connection's remote port may be
-// ephemeral, so retain only outgoing BitTorrent endpoints, preferring seeds.
-static void remember_stream_peers(SessionWrapper* sw, lt_torrent_id tid,
-                                  const lt::torrent_handle& handle) {
-    std::vector<lt::peer_info> connected;
-    handle.get_peer_info(connected);
-    std::stable_sort(connected.begin(), connected.end(), [](const auto& a, const auto& b) {
-        const bool a_seed = bool(a.flags & lt::peer_info::seed);
-        const bool b_seed = bool(b.flags & lt::peer_info::seed);
-        return a_seed != b_seed ? a_seed : a.payload_down_speed > b.payload_down_speed;
-    });
-    std::vector<lt::tcp::endpoint> endpoints;
-    const auto append = [&](const lt::tcp::endpoint& endpoint) {
-        if (endpoints.size() < 64 && endpoint.port() != 0 && !endpoint.address().is_unspecified()
-            && std::find(endpoints.begin(), endpoints.end(), endpoint) == endpoints.end())
-            endpoints.push_back(endpoint);
-    };
-    for (const auto& peer : connected) {
-        if ((peer.flags & lt::peer_info::outgoing_connection)
-            && !(peer.connection_type & (lt::peer_info::web_seed | lt::peer_info::http_seed)))
-            append(peer.ip);
-    }
-    // Rapid switches may occur before a connection completes. Keep prior hints.
-    for (const auto& endpoint : sw->reconnect_peers[tid]) append(endpoint);
-    sw->reconnect_peers[tid] = std::move(endpoints);
-}
-
-// Caller holds lifecycle_mu. Explicit replacement stops every stream of this torrent.
-// Rebuild from metadata, never resume data: old have-bits and pending disk jobs
-// must not survive deletion. A failed/slow delete blocks the next episode.
-static bool reset_stream_data(SessionWrapper* sw, lt_torrent_id tid) {
-    std::shared_ptr<TorrentReset> reset;
-    {
-        std::lock_guard<std::mutex> lock(sw->mu);
-        auto pending = sw->resets.find(tid);
-        if (pending != sw->resets.end()) reset = pending->second;
-    }
-    if (!reset) {
-        lt::torrent_handle handle;
-        {
-            std::lock_guard<std::mutex> lock(sw->mu);
-            auto found = sw->handles.find(tid);
-            if (found == sw->handles.end() || !found->second.is_valid()) {
-                set_err("torrent not found during episode cleanup"); return false;
-            }
-            handle = found->second;
-            for (const auto& entry : sw->handles) {
-                if (entry.first != tid && entry.second == handle) {
-                    set_err("cannot clear episode data while another task shares this torrent");
-                    return false;
-                }
-            }
-        }
-        auto ti = handle.torrent_file();
-        if (!ti) { set_err("no metadata for episode cleanup"); return false; }
-        reset = std::make_shared<TorrentReset>();
-        reset->previous = handle;
-        reset->params.ti = std::make_shared<lt::torrent_info>(*ti);
-        reset->params.save_path = handle.status().save_path;
-        reset->params.storage_mode = lt::storage_mode_sparse;
-        reset->params.flags = handle.flags() | lt::torrent_flags::paused | lt::torrent_flags::duplicate_is_error;
-        reset->params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::seed_mode
-            | lt::torrent_flags::stop_when_ready | lt::torrent_flags::sequential_download);
-        reset->params.file_priorities.assign(size_t(ti->num_files()), lt::dont_download);
-        reset->params.max_connections = handle.max_connections();
-        reset->params.max_uploads = handle.max_uploads();
-        reset->params.upload_limit = handle.upload_limit();
-        reset->params.download_limit = handle.download_limit();
-        remember_stream_peers(sw, tid, handle);
-        reset->params.peers = sw->reconnect_peers[tid];
-        for (const auto& tracker : handle.trackers()) {
-            reset->params.trackers.push_back(tracker.url);
-            reset->params.tracker_tiers.push_back(tracker.tier);
-        }
-        const auto web_seeds = handle.url_seeds();
-        reset->params.url_seeds.assign(web_seeds.begin(), web_seeds.end());
-        const auto http_seeds = handle.http_seeds();
-        reset->params.http_seeds.assign(http_seeds.begin(), http_seeds.end());
-
-        auto owners = sw->active_stream_ids.find(tid);
-        if (owners != sw->active_stream_ids.end()) {
-            const auto ids = owners->second;
-            for (auto sid : ids) stop_stream_internal(sw, sid);
-        }
-        {
-            std::lock_guard<std::mutex> lock(sw->streams_mu);
-            sw->schedulers.erase(tid);
-        }
-        {
-            std::lock_guard<std::mutex> lock(sw->mu);
-            sw->resets[tid] = reset;
-        }
-        sw->needs_reset.insert(tid);
-        sw->session.remove_torrent(handle, lt::session::delete_files);
-    }
-
-    std::unique_lock<std::mutex> lock(sw->mu);
-    if (!sw->reset_cv.wait_for(lock, chr::seconds(30), [&] { return reset->done; })) {
-        set_err("previous episode cleanup timed out; retry switchFile with the same torrentId");
-        return false; // keep metadata and wait for the same deletion on retry
-    }
-    const auto deletion_error = reset->error;
-    lt::error_code add_error;
-    auto replacement = sw->session.add_torrent(reset->params, add_error);
-    if (add_error) {
-        set_err("cannot restore episode metadata: " + add_error.message());
-        return false;
-    }
-    sw->handles[tid] = replacement;
-    sw->resets.erase(tid);
-    if (deletion_error) {
-        // Metadata is restored paused, but a later start must retry cleanup.
-        set_err("cannot clear previous episode data: " + deletion_error.message());
-        return false;
-    }
-    sw->needs_reset.erase(tid);
-    set_err("");
-    return true;
 }
 
 // ── piece waiting — port of blocking read in TorrServer's Reader.Read ────────
@@ -2560,8 +2510,7 @@ TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
         sp.set_bool(lt::settings_pack::close_redundant_connections, false);
         sp.set_int (lt::settings_pack::peer_turnover,             5);
         sp.set_int (lt::settings_pack::peer_turnover_interval,    30);
-        // No resume data is restored by this bridge. Skipping the initial
-        // check would treat existing local pieces as missing and redownload them.
+        // Validate restored incomplete data against disk instead of trusting stale state.
         sp.set_bool(lt::settings_pack::no_recheck_incomplete_resume, false);
         sp.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
         sp.set_bool(lt::settings_pack::rate_limit_ip_overhead,    false);
@@ -2650,15 +2599,7 @@ TORRENT_API void lt_destroy_session(lt_session_t session) {
         if (sw->alert_thread.joinable()) sw->alert_thread.join();
     } catch (...) {}
 
-    // flush resume data
-    try {
-        std::lock_guard<std::mutex> lk(sw->mu);
-        for (auto& kv : sw->handles)
-            if (kv.second.is_valid())
-                try { kv.second.save_resume_data(lt::torrent_handle::flush_disk_cache); } catch (...) {}
-    } catch (...) {}
-
-    std::this_thread::sleep_for(chr::milliseconds(200));
+    // The Dart owner awaits persistence before destruction, while alerts are alive.
     try { delete sw; } catch (...) {}
 }
 
@@ -2690,7 +2631,7 @@ TORRENT_API void lt_poll_alerts(lt_session_t session,
 // for a duplicate info-hash. It must keep one ID/scheduler/cleanup owner here
 // too; a second ID would make switchFile unsafe and misroute piece alerts.
 static lt_torrent_id register_torrent(SessionWrapper* sw, const lt::torrent_handle& handle,
-                                      bool stream_only) {
+                                      bool stream_only, bool resume = true) {
     for (const auto& entry : sw->handles) {
         if (entry.second != handle) continue;
         if ((sw->stream_only_torrents.count(entry.first) != 0) != stream_only) {
@@ -2702,7 +2643,7 @@ static lt_torrent_id register_torrent(SessionWrapper* sw, const lt::torrent_hand
         set_err("");
         return entry.first;
     }
-    handle.resume();
+    if (resume) handle.resume();
     const auto id = sw->next_id.fetch_add(1);
     sw->handles[id] = handle;
     if (stream_only) sw->stream_only_torrents.insert(id);
@@ -2785,6 +2726,138 @@ TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
 }
 
+// Start a non-blocking flush/snapshot. One outstanding request per task.
+TORRENT_API int lt_request_resume_data(lt_session_t session, lt_torrent_id id) {
+    set_err("");
+    if (!session) { set_err("null session"); return -1; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lifecycle(sw->lifecycle_mu);
+    try {
+        ResumeRequest request;
+        {
+            std::lock_guard<std::mutex> lock(sw->mu);
+            request.handle = sw->handles.at(id);
+            request.stream_only = sw->stream_only_torrents.count(id) != 0;
+        }
+        if (request.handle.torrent_file())
+            request.selection = download_scheduler(sw, id)->download_priorities();
+        std::lock_guard<std::mutex> lock(sw->resume_mu);
+        auto previous = sw->resume_requests.find(id);
+        if (previous != sw->resume_requests.end() && previous->second.pending) return 0;
+        sw->resume_requests[id] = std::move(request);
+        sw->handles.at(id).save_resume_data(lt::torrent_handle::flush_disk_cache
+            | lt::torrent_handle::save_info_dict);
+        return 1;
+    } catch (const std::exception& e) { set_err(e.what()); return -1; }
+}
+
+// 0 pending, -1 failed/removed, otherwise required size. Copy does not consume.
+TORRENT_API int lt_read_resume_data(lt_session_t session, lt_torrent_id id, char* out, int capacity) {
+    set_err("");
+    if (!session) { set_err("null session"); return -1; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lock(sw->resume_mu);
+    auto found = sw->resume_requests.find(id);
+    if (found == sw->resume_requests.end()) { set_err("resume request not found"); return -1; }
+    const auto& request = found->second;
+    if (request.pending) return 0;
+    if (!request.error.empty()) { set_err(request.error); return -1; }
+    const int size = int(request.bytes.size());
+    if (out && capacity >= size) std::memcpy(out, request.bytes.data(), size);
+    return size;
+}
+
+static bool matching_hashes(const lt::info_hash_t& a, const lt::info_hash_t& b) {
+    return (a.has_v1() && b.has_v1() && a.v1 == b.v1)
+        || (a.has_v2() && b.has_v2() && a.v2 == b.v2);
+}
+
+TORRENT_API lt_torrent_id lt_find_torrent_by_magnet(lt_session_t session, const char* magnet) {
+    set_err("");
+    if (!session || !magnet) { set_err("null argument"); return -1; }
+    try {
+        lt::error_code ec;
+        const auto params = lt::parse_magnet_uri(magnet, ec);
+        if (ec) throw std::runtime_error(ec.message());
+        auto* sw = to_sw(session);
+        std::lock_guard<std::mutex> lock(sw->mu);
+        for (const auto& item : sw->handles)
+            if (matching_hashes(params.info_hashes, item.second.info_hashes())) return item.first;
+        return 0;
+    } catch (const std::exception& e) { set_err(e.what()); return -1; }
+}
+
+TORRENT_API const char* lt_get_torrent_magnet(lt_session_t session, lt_torrent_id id) {
+    static thread_local std::string result;
+    result.clear();
+    set_err("");
+    try {
+        if (!session) throw std::invalid_argument("null session");
+        auto* sw = to_sw(session);
+        std::lock_guard<std::mutex> lock(sw->mu);
+        lt::add_torrent_params params;
+        params.info_hashes = sw->handles.at(id).info_hashes();
+        result = lt::make_magnet_uri(params);
+    } catch (const std::exception& e) { set_err(e.what()); }
+    return result.c_str();
+}
+
+static lt::add_torrent_params decode_download_resume(const char* data, int size, bool& stream_only) {
+    if (!data || size <= 0) throw std::invalid_argument("invalid resume buffer");
+    lt::error_code ec;
+    auto node = lt::bdecode(lt::span<char const>(data, size), ec);
+    if (ec || node.type() != lt::bdecode_node::dict_t
+        || node.dict_find_int_value("ltf-version") != 1)
+        throw std::invalid_argument("invalid or unsupported download resume data");
+    auto params = lt::read_resume_data(node, ec);
+    if (ec) throw std::runtime_error(ec.message());
+    if (params.save_path.empty()) throw std::invalid_argument("resume save path is empty");
+    stream_only = node.dict_find_int_value("ltf-stream-only") != 0;
+    params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::stop_when_ready);
+    params.piece_priorities.clear();
+    if (params.ti && !params.file_priorities.empty()
+        && params.file_priorities.size() != size_t(params.ti->num_files()))
+        throw std::invalid_argument("resume file selection does not match metadata");
+    return params;
+}
+
+TORRENT_API lt_torrent_id lt_validate_resume_data(lt_session_t session, const char* data, int size) {
+    (void)session;
+    set_err("");
+    try {
+        bool stream_only = false;
+        decode_download_resume(data, size, stream_only);
+        return 1;
+    } catch (const std::exception& e) { set_err(e.what()); return -1; }
+}
+
+TORRENT_API lt_torrent_id lt_restore_resume_data(lt_session_t session, const char* data, int size) {
+    set_err("");
+    if (!session || !data || size <= 0) { set_err("invalid resume buffer"); return -1; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lifecycle(sw->lifecycle_mu);
+    try {
+        bool stream_only = false;
+        auto params = decode_download_resume(data, size, stream_only);
+        lt::error_code ec;
+        const auto selection = params.file_priorities;
+        std::lock_guard<std::mutex> streams_lock(sw->streams_mu);
+        std::lock_guard<std::mutex> lock(sw->mu);
+        // Restore is idempotent and must never overwrite a live task's selection.
+        for (const auto& item : sw->handles)
+            if (matching_hashes(params.info_hashes, item.second.info_hashes())) return item.first;
+        auto handle = sw->session.add_torrent(std::move(params), ec);
+        if (ec) throw std::runtime_error(ec.message());
+        const auto id = register_torrent(sw, handle, stream_only, false);
+        if (handle.torrent_file()) {
+            auto scheduler = std::make_shared<StreamScheduler>(handle, true);
+            if (!selection.empty()) scheduler->select_files(selection);
+            sw->schedulers[id] = scheduler;
+        }
+        return id;
+    } catch (const std::exception& e) { set_err(e.what()); return -1; }
+}
+
 TORRENT_API void lt_remove_torrent(lt_session_t session,
                                    lt_torrent_id id, int del) {
     if (!session) return;
@@ -2837,7 +2910,6 @@ TORRENT_API int lt_get_all_statuses(lt_session_t session,
     int n = 0;
     for (auto& kv : sw->handles) {
         if (n >= max) break;
-        if (sw->reset_status(kv.first, out[n])) { ++n; continue; }
         if (!kv.second.is_valid()) continue;
         try {
             lt::torrent_status st = kv.second.status(lt::torrent_handle::query_pieces);
@@ -2853,7 +2925,6 @@ TORRENT_API int lt_get_status(lt_session_t session, lt_torrent_id id,
     if (!session || !out) return 0;
     auto* sw = to_sw(session);
     std::lock_guard<std::mutex> lk(sw->mu);
-    if (sw->reset_status(id, *out)) return 1;
     auto it = sw->handles.find(id);
     if (it == sw->handles.end() || !it->second.is_valid()) return 0;
     try { fill_status(*out, id,
@@ -2916,36 +2987,111 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
 
 TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
                                         const int32_t* priorities, int count) {
-    if (!session || !priorities || count <= 0) return;
+    set_err("");
+    if (!session || !priorities || count <= 0) { set_err("invalid file priorities"); return; }
     auto* sw = to_sw(session);
     std::lock_guard<std::mutex> lifecycle_lock(sw->lifecycle_mu);
     if (sw->active_stream_ids.count(id)) {
         set_err("stop active streams before changing file priorities"); return;
     }
-    {
-        std::lock_guard<std::mutex> lock(sw->streams_mu);
-        sw->schedulers.erase(id);
-    }
-    std::lock_guard<std::mutex> lk(sw->mu);
-    auto it = sw->handles.find(id);
-    if (it == sw->handles.end() || !it->second.is_valid()) return;
     try {
-        auto ti = it->second.torrent_file();
-        if (!ti) return;
-        int nf = ti->files().num_files();
-        std::vector<lt::download_priority_t> p;
-        p.reserve(nf);
-        for (int i = 0; i < nf; ++i)
-            p.push_back((i < count && priorities[i]) ? lt::default_priority : lt::dont_download);
-        it->second.prioritize_files(p);
-        it->second.unset_flags(lt::torrent_flags::stop_when_ready);
-        it->second.resume();
-    } catch (...) {}
+        const auto scheduler = download_scheduler(sw, id);
+        auto selection = scheduler->download_priorities();
+        if (size_t(count) > selection.size()) throw std::invalid_argument("too many file priorities");
+        for (int i = 0; i < count; ++i)
+            if (priorities[i] < 0 || priorities[i] > 7) throw std::invalid_argument("file priority must be 0..7");
+        for (size_t i = 0; i < selection.size(); ++i)
+            selection[i] = lt::download_priority_t(i < size_t(count) ? priorities[i] : 0);
+        scheduler->select_files(selection);
+        std::lock_guard<std::mutex> lock(sw->mu);
+        auto handle = sw->handles.at(id);
+        handle.unset_flags(lt::torrent_flags::stop_when_ready);
+        handle.resume();
+    } catch (const std::exception& error) { set_err(error.what()); }
+}
+
+TORRENT_API int lt_download_file(lt_session_t session, lt_torrent_id id, int file_index) {
+    set_err("");
+    if (!session) { set_err("null session"); return 0; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lifecycle_lock(sw->lifecycle_mu);
+    try {
+        std::shared_ptr<const lt::torrent_info> ti;
+        {
+            std::lock_guard<std::mutex> lock(sw->mu);
+            ti = sw->metadata(id);
+        }
+        if (!ti) throw std::runtime_error("torrent not found or metadata is not ready");
+        if (file_index < 0 || file_index >= ti->num_files() || ti->files().pad_file_at(lt::file_index_t(file_index)))
+            throw std::invalid_argument("invalid download file index");
+        download_scheduler(sw, id)->download_file(file_index);
+        std::lock_guard<std::mutex> lock(sw->mu);
+        auto handle = sw->handles.at(id);
+        handle.unset_flags(lt::torrent_flags::stop_when_ready);
+        handle.resume();
+        return 1;
+    } catch (const std::exception& error) { set_err(error.what()); return 0; }
+}
+
+TORRENT_API int lt_has_downloads(lt_session_t session, lt_torrent_id id) {
+    set_err("");
+    if (!session) { set_err("null session"); return -1; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lifecycle_lock(sw->lifecycle_mu);
+    try {
+        {
+            std::lock_guard<std::mutex> lock(sw->mu);
+            auto found = sw->handles.find(id);
+            if (found == sw->handles.end() || !found->second.is_valid()) return 0;
+            // A normal magnet owns a download even before its file list arrives.
+            if (!found->second.torrent_file()) return sw->stream_only_torrents.count(id) ? 0 : 1;
+        }
+        return download_scheduler(sw, id)->has_downloads() ? 1 : 0;
+    } catch (const std::exception& error) { set_err(error.what()); return -1; }
+}
+
+TORRENT_API int lt_get_file_downloads(lt_session_t session, lt_torrent_id id,
+                                     lt_file_download_status* out, int max_count) {
+    set_err("");
+    if (!session || !out || max_count <= 0) { set_err("invalid download status buffer"); return -1; }
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lifecycle_lock(sw->lifecycle_mu);
+    try {
+        const auto selection = download_scheduler(sw, id)->download_priorities();
+        lt::torrent_handle handle;
+        {
+            std::lock_guard<std::mutex> lock(sw->mu);
+            handle = sw->handles.at(id);
+        }
+        const auto ti = handle.torrent_file();
+        const auto& files = ti->files();
+        const auto status = handle.status(lt::torrent_handle::query_pieces);
+        int count = 0;
+        for (int file = 0; file < files.num_files() && count < max_count; ++file) {
+            if (selection[file] == lt::dont_download) continue;
+            auto& result = out[count++];
+            result = {};
+            result.file_index = file;
+            result.priority = static_cast<std::uint8_t>(selection[file]);
+            const auto index = lt::file_index_t(file);
+            const int64_t first_byte = files.file_offset(index);
+            result.file_size = files.file_size(index);
+            const int64_t end_byte = first_byte + result.file_size;
+            for (int piece = int(first_byte / ti->piece_length()); result.file_size > 0
+                 && piece <= (end_byte - 1) / ti->piece_length(); ++piece) {
+                if (piece >= status.pieces.size() || !status.pieces[lt::piece_index_t(piece)]) continue;
+                result.verified_bytes += std::min(end_byte, int64_t(piece + 1) * ti->piece_length())
+                    - std::max(first_byte, int64_t(piece) * ti->piece_length());
+            }
+            result.is_complete = result.verified_bytes == result.file_size ? 1 : 0;
+        }
+        return count;
+    } catch (const std::exception& error) { set_err(error.what()); return -1; }
 }
 
 // ── streaming ───────────────────────────────────────────────────────────────────
 
-// Serialize validation, optional explicit cleanup and startup as one operation.
+// Serialize validation, optional stream replacement and startup as one operation.
 // startStream never deletes data or replaces existing streams implicitly.
 static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
                                 int file_index, int64_t max_cache_bytes, bool switch_file) {
@@ -2986,15 +3132,6 @@ static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
         set_err("selected file is empty"); return -1;
     }
 
-    if (switch_file) {
-        try {
-            if (!reset_stream_data(sw, torrent_id)) return -1;
-        } catch (const std::exception& error) {
-            set_err(error.what()); return -1;
-        }
-    } else if (sw->needs_reset.count(torrent_id)) {
-        set_err("episode cleanup is incomplete; use switchFile to retry"); return -1;
-    }
     lt::torrent_handle handle;
     {
         std::lock_guard<std::mutex> lock(sw->mu);
@@ -3003,6 +3140,20 @@ static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
         handle = found->second;
     }
     if (!handle.is_valid()) { set_err("invalid handle"); return -1; }
+
+    if (switch_file) {
+        // Withdraw every old stream's demands. The scheduler preserves full-file
+        // download baselines; disk pieces and peer connections remain intact.
+        try {
+            auto owners = sw->active_stream_ids.find(torrent_id);
+            if (owners != sw->active_stream_ids.end()) {
+                const auto ids = owners->second;
+                for (auto sid : ids) stop_stream_internal(sw, sid);
+            }
+        } catch (const std::exception& error) {
+            set_err(error.what()); return -1;
+        }
+    }
 
     std::unique_lock<std::mutex> startup_lock(sw->streams_mu);
     auto s = std::make_unique<StreamEngine>();
@@ -3073,7 +3224,10 @@ static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
 
     try {
         auto& scheduler = sw->schedulers[torrent_id];
-        if (!scheduler) scheduler = std::make_shared<StreamScheduler>(handle);
+        if (!scheduler) {
+            std::lock_guard<std::mutex> lock(sw->mu);
+            scheduler = std::make_shared<StreamScheduler>(handle, !sw->stream_only_torrents.count(torrent_id));
+        }
         s->scheduler = scheduler;
         scheduler->add_stream(s->id);
         handle.unset_flags(lt::torrent_flags::stop_when_ready);
@@ -3161,8 +3315,8 @@ TORRENT_API lt_stream_id lt_switch_file(lt_session_t session, lt_torrent_id torr
     return open_stream(session, torrent_id, file_index, max_cache_bytes, true);
 }
 
-// Keep the legacy symbol for existing native clients. New Dart bindings use
-// the explicit-policy symbol so an old binary cannot silently ignore the flag.
+// Retain both stop symbols for ABI compatibility. Both now withdraw playback
+// demands only; explicit torrent removal is the sole deletion path.
 TORRENT_API void lt_stop_stream(lt_session_t session, lt_stream_id sid) {
     lt_stop_stream_ex(session, sid, 0);
 }
@@ -3173,18 +3327,8 @@ TORRENT_API void lt_stop_stream_ex(lt_session_t session, lt_stream_id sid, int k
     std::lock_guard<std::mutex> lifecycle_lock(sw->lifecycle_mu);
     set_err("");
     try {
-        const auto tid = stop_stream_internal(sw, sid);
-        if (tid < 0 || sw->active_stream_ids.count(tid)) return;
-        if (!keep_torrent) {
-            remove_torrent_internal(sw, tid, true);
-        } else {
-            bool stream_only = false;
-            {
-                std::lock_guard<std::mutex> lock(sw->mu);
-                stream_only = sw->stream_only_torrents.count(tid) != 0;
-            }
-            if (stream_only) reset_stream_data(sw, tid);
-        }
+        (void)keep_torrent; // Kept for ABI compatibility; stopping never deletes data.
+        stop_stream_internal(sw, sid);
     } catch (const std::exception& error) {
         set_err(error.what());
     }

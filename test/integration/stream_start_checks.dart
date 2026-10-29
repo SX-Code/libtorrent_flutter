@@ -72,8 +72,6 @@ Future<void> checkStreamStartWaits() async {
     await Directory('${directory.path}/episodes').create(recursive: true);
     await File('${directory.path}/episodes/first.mp4')
         .writeAsBytes(List<int>.filled(16384, 65), flush: true);
-    await File('${directory.path}/episodes/second.mp4')
-        .writeAsBytes(List<int>.filled(16384, 66), flush: true);
     engine.recheckTorrent(id);
     final retry = engine.waitForStreamStart(first.id,
         timeout: const Duration(seconds: 10));
@@ -96,11 +94,21 @@ Future<void> checkStreamStartWaits() async {
     final replacement = engine.switchFile(id, fileIndex: 0);
     _check(await switchWait == StreamStartResult.invalid,
         'switch did not invalidate pending wait');
-    final stopWait = engine.waitForStreamStart(replacement.id);
+    _check(
+        await engine.waitForStreamStart(replacement.id) ==
+            StreamStartResult.ready,
+        'switching back lost previously downloaded startup data');
+    final retained =
+        await File('${directory.path}/episodes/first.mp4').readAsBytes();
+    _check(retained.length == 16384 && retained.every((byte) => byte == 65),
+        'switch changed the downloaded file');
     engine.stopStream(replacement.id, keepTorrent: true);
-    _check(await stopWait == StreamStartResult.invalid,
-        'stop did not invalidate pending wait');
-    final removable = engine.startStream(id, fileIndex: 0);
+    _check(
+        await engine.waitForStreamStart(replacement.id) ==
+            StreamStartResult.invalid,
+        'stop did not invalidate ready stream');
+    // The second file remains missing, so removal invalidates a pending wait.
+    final removable = engine.startStream(id, fileIndex: 1);
     final removeWait = engine.waitForStreamStart(removable.id);
     engine.removeTorrent(id, deleteFiles: true);
     _check(await removeWait == StreamStartResult.invalid,

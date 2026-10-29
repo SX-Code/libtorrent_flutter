@@ -6,20 +6,24 @@
 
 ## 2.0.1-dev.1（尚未发布）
 
+- 新增 `saveDownloadState`、`restoreDownloadState` 和按 infohash 查询的 `findTorrentByMagnet`；仅恢复下载任务，包括已完成文件、等待元数据的普通磁力。
+- `init` 新增 `downloadStateDirectory`、`downloadStateSaveInterval`；支持变更后自动保存、定期保存和 `downloadStateErrors` 错误通知。等待 libtorrent 恢复数据回调后原子替换记录，不保存播放优先级／deadline。
+- 退出前等待保存，保存失败保留引擎供重试；显式删除先移除持久化记录，并发旧快照不能恢复已删除任务。恢复前校验损坏记录，保留已有同磁力任务的选择与暂停状态。需重编译含新增 FFI 接口的原生库。
+
 - 调试期间，GitHub Actions 暂时只构建 iOS，其他平台任务保留但停用。
 - 新增 `waitForStreamStart`，返回 `StreamStartResult.ready/timeout/invalid`。每个异步等待独立计时，检查所选文件首分片是否完成校验且可读；超时保留流并允许重试，停流、切集、删除任务或销毁引擎会使旧等待失效。需要新增的原生导出 `lt_check_stream_start`。
-- 切集清理时保留最多 64 个主动连接 peer 的地址，优先保留 seed，快速连续切集时仍保留地址线索。重建后的 torrent 可尝试直接重连，不必完全依赖重新发现 peer；旧下载数据及“已拥有分片”状态仍会清除。
+- **切集复用任务**：`switchFile` 保留 torrent、peer 连接和已下载分片，撤销旧流需求并提高新集启动分片优先级，不再删除磁盘数据或重建任务；切回可复用旧数据，磁盘占用可能累积。清理策略变更见下方。
 - 显式转换 libtorrent 状态到公共 C/Dart 枚举，修复下载中错误显示为 `Finished`、选中分片完成错误显示为 `Seeding` 的问题。
-- 重复添加磁力或 `.torrent` 文件、解析到同一原生 handle 时，复用已有 torrent ID。保留原保存路径和状态，拒绝冲突的 `streamOnly` 模式，避免多个任务 ID 共用 handle 导致 `switchFile` 无法清理旧集。
+- 重复添加磁力或 `.torrent` 文件、解析到同一原生 handle 时，复用已有 torrent ID。保留原保存路径和状态，拒绝冲突的 `streamOnly` 模式，避免多个任务 ID 共用 handle 导致生命周期策略冲突。
 - 阻塞 HTTP 读取的缺失分片会提升为立即 deadline，即使此前已经按较晚的播放 deadline 预取。修复容器探测或播放器缓冲快于估算播放速率时，缺片未及时提升紧急程度的问题。
 - 修复启动阶段 Range 探测互相取消：每个 HTTP GET 独立持有并合并下载窗口和 deadline，断开连接只撤回自身需求；HEAD 不改变播放状态或调度。Range 偏移变化不再被当作用户拖动，状态跟随第一个活动 GET。
 - 新增可选 HTTP Range、等待和完成日志，通过 `TB_LOG_FILE=stderr` 或可写文件路径启用。原生回归覆盖 HEAD 隔离、并发探测、共享分片传递以及断开／删除后的清理。
-- 为 `stopStream` 和 `stopAllStreamsForTorrent` 增加 `keepTorrent` 参数，默认 `false`；两种模式下停止最后一个流都会删除任务及文件。
-- **显式切集策略**：`streamOnly=true` 只表达按需下载；`switchFile` 控制替换和清理。首次使用 `startStream`，切集使用 `switchFile` 停止旧流、等待下载文件和 partfile 删除，再使用相同任务 ID 和元数据启动新流，并重建分片拥有状态。两种模式的 `startStream` 都允许不同文件并发播放，不会隐式切集或清理，因此数据可能累积。按需任务停止最后一个流且 `keepTorrent: true` 时，只保留元数据。切集会重新建立 BT 连接。
-- **普通下载兼容性**：`streamOnly=false` 的调用方若要在停流后保留文件，必须显式传 `keepTorrent: true`；示例中的停止流操作已更新。保留任务不会恢复全文件下载。
+- **清理行为变更**：`stopStream` 和 `stopAllStreamsForTorrent` 只撤销播放需求，保留任务和文件；`keepTorrent` 保留兼容但忽略其值。删除需显式调用 `removeTorrent`／`disposeTorrent`／`disposeAll`。
+- **显式切集策略**：首次使用 `startStream`，切集使用 `switchFile` 替换全部旧流并保留数据。两种模式的 `startStream` 都允许不同文件并发播放，不会隐式切集或清理。已缓存数据持续可复用和上传。
+- **下载与播放合并**：新增 `downloadFile`、`hasDownloads`、`getFileDownloads` 和 `FileDownloadInfo`。C++ 按文件维护完整下载基础优先级，与活动流需求合并；切集、拖动和停流不会取消下载。普通下载任务保留原文件选择，进度只统计校验通过的字节和完整边界分片。
 - 按流合并优先级和 deadline，并向相同／不同文件的多个流分发分片事件。生命周期操作串行化；直接 `removeTorrent` 会停止全部关联流，不递归触发删除。
-- 将切集清理错误传递到 Dart，保留元数据供重试，并在显式切集后立即从 Dart 状态中移除已停止流的 URL。
-- 要求重编译导出 `lt_stop_stream_ex` 和 `lt_switch_file` 的原生产物；旧的原生停止入口采用默认删除策略。
+- `dispose()` 保留下载任务文件（包括已完成任务）、删除临时任务；移除旧的停流删除重建路径。下载任务持久化与恢复见本节新增接口。
+- 要求配套重编译原生库，新增导出 `lt_download_file`、`lt_has_downloads`、`lt_get_file_downloads`。旧原生 stop 入口也采用仅停流语义。
 - 从分支提交 `586a129`、`88eb0ab` 移植有界分片缓存和滑动流窗口，保留独立拥有的缓冲区以及 2.0.0 的 Android／Range 修复。
 - 恢复 FFI 文件列表中的文件大小；未提供恢复状态时，校验已有本地文件。
 - 串行处理缓存淘汰和元数据／启动优先级修改；流式播放时保留空闲 seed 连接。

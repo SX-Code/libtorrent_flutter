@@ -14,6 +14,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'ffi_bindings.dart';
 import 'models.dart';
 
+part 'download_persistence.dart';
+
 // ─── Tracker Management ─────────────────────────────────────────────────────
 
 /// Automatically fetches and injects best public trackers into magnet URIs.
@@ -61,47 +63,47 @@ class TrackerManager {
 // ─── Status converters ──────────────────────────────────────────────────────
 
 TorrentInfo _toTorrentInfo(LtTorrentStatus s) => TorrentInfo(
-  id: s.id,
-  name: readCharArray(s.name, 512),
-  savePath: readCharArray(s.savePath, 1024),
-  errorMsg: readCharArray(s.errorMsg, 256),
-  state: stateFromInt(s.state),
-  progress: s.progress.clamp(0.0, 1.0),
-  downloadRate: s.downloadRate,
-  uploadRate: s.uploadRate,
-  totalDone: s.totalDone,
-  totalWanted: s.totalWanted,
-  totalUploaded: s.totalUploaded,
-  numPeers: s.numPeers,
-  numSeeds: s.numSeeds,
-  isPaused: s.isPaused != 0,
-  isFinished: s.isFinished != 0,
-  hasMetadata: s.hasMetadata != 0,
-  queuePosition: s.queuePosition,
-);
+      id: s.id,
+      name: readCharArray(s.name, 512),
+      savePath: readCharArray(s.savePath, 1024),
+      errorMsg: readCharArray(s.errorMsg, 256),
+      state: stateFromInt(s.state),
+      progress: s.progress.clamp(0.0, 1.0),
+      downloadRate: s.downloadRate,
+      uploadRate: s.uploadRate,
+      totalDone: s.totalDone,
+      totalWanted: s.totalWanted,
+      totalUploaded: s.totalUploaded,
+      numPeers: s.numPeers,
+      numSeeds: s.numSeeds,
+      isPaused: s.isPaused != 0,
+      isFinished: s.isFinished != 0,
+      hasMetadata: s.hasMetadata != 0,
+      queuePosition: s.queuePosition,
+    );
 
 FileInfo _toFileInfo(LtFileInfo f) => FileInfo(
-  index: f.index,
-  name: readCharArray(f.name, 512),
-  path: readCharArray(f.path, 1024),
-  size: f.size,
-  isStreamable: f.isStreamable != 0,
-);
+      index: f.index,
+      name: readCharArray(f.name, 512),
+      path: readCharArray(f.path, 1024),
+      size: f.size,
+      isStreamable: f.isStreamable != 0,
+    );
 
 StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
-  id: s.id,
-  torrentId: s.torrentId,
-  fileIndex: s.fileIndex,
-  url: readCharArray(s.url, 256),
-  fileSize: s.fileSize,
-  readHead: s.readHead,
-  streamState: streamStateFromInt(s.streamState),
-  bufferSeconds: s.bufferSeconds,
-  bufferPieces: s.bufferPieces,
-  readaheadWindow: s.readaheadWindow,
-  activePeers: s.activePeers,
-  downloadRate: s.downloadRate,
-);
+      id: s.id,
+      torrentId: s.torrentId,
+      fileIndex: s.fileIndex,
+      url: readCharArray(s.url, 256),
+      fileSize: s.fileSize,
+      readHead: s.readHead,
+      streamState: streamStateFromInt(s.streamState),
+      bufferSeconds: s.bufferSeconds,
+      bufferPieces: s.bufferPieces,
+      readaheadWindow: s.readaheadWindow,
+      activePeers: s.activePeers,
+      downloadRate: s.downloadRate,
+    );
 
 // ─── LibtorrentFlutter ──────────────────────────────────────────────────────
 
@@ -116,6 +118,7 @@ StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
 /// ```
 class LibtorrentFlutter {
   static LibtorrentFlutter? _instance;
+  static Future<void>? _initializing;
 
   late final TorrentBridgeBindings _b;
   late final Pointer<LtSessionOpaque> _session;
@@ -126,6 +129,14 @@ class LibtorrentFlutter {
   final Map<int, TorrentInfo> _torrents = {};
   Timer? _pollTimer;
   bool _disposed = false;
+  bool _disposing = false;
+  Future<void>? _disposeFuture;
+  late final _DownloadPersistence _persistence = _DownloadPersistence(this);
+
+  void _checkAlive() {
+    if (_disposed || _disposing)
+      throw StateError('Engine is closing or disposed');
+  }
 
   // Stream status
   final _streamsCtrl = StreamController<Map<int, StreamInfo>>.broadcast();
@@ -152,6 +163,8 @@ class LibtorrentFlutter {
   /// - [downloadLimit] / [uploadLimit] — speed limits in bytes/sec (0 = unlimited).
   /// - [pollInterval] — how often to poll for torrent/stream status updates.
   /// - [fetchTrackers] — automatically fetch best public trackers on startup.
+  /// - [downloadStateDirectory] — durable task-state directory; restores before init completes.
+  /// - [downloadStateSaveInterval] — periodic resume checkpoint interval (positive).
   /// - [defaultSavePath] — where to save torrent data. Defaults to system temp dir.
   static Future<void> init({
     String listenInterface = '',
@@ -160,9 +173,38 @@ class LibtorrentFlutter {
     Duration pollInterval = const Duration(milliseconds: 600),
     bool fetchTrackers = true,
     String? defaultSavePath,
+    String? downloadStateDirectory,
+    Duration downloadStateSaveInterval = const Duration(seconds: 30),
+  }) {
+    if (_instance != null) return Future<void>.value();
+    return _initializing ??= _initialize(
+      listenInterface: listenInterface,
+      downloadLimit: downloadLimit,
+      uploadLimit: uploadLimit,
+      pollInterval: pollInterval,
+      fetchTrackers: fetchTrackers,
+      defaultSavePath: defaultSavePath,
+      downloadStateDirectory: downloadStateDirectory,
+      downloadStateSaveInterval: downloadStateSaveInterval,
+    ).whenComplete(() => _initializing = null);
+  }
+
+  static Future<void> _initialize({
+    String listenInterface = '',
+    int downloadLimit = 0,
+    int uploadLimit = 0,
+    Duration pollInterval = const Duration(milliseconds: 600),
+    bool fetchTrackers = true,
+    String? defaultSavePath,
+    String? downloadStateDirectory,
+    Duration downloadStateSaveInterval = const Duration(seconds: 30),
   }) async {
-    if (_instance != null) return;
+    if (downloadStateSaveInterval <= Duration.zero) {
+      throw ArgumentError.value(
+          downloadStateSaveInterval, 'downloadStateSaveInterval');
+    }
     final engine = LibtorrentFlutter._();
+    engine._persistence.interval = downloadStateSaveInterval;
 
     // Fetch best trackers in background (fire & forget)
     if (fetchTrackers) {
@@ -240,8 +282,20 @@ class LibtorrentFlutter {
       malloc.free(iface);
     }
 
-    _instance = engine;
     engine._defaultSavePath = defaultSavePath ?? Directory.systemTemp.path;
+    try {
+      if (downloadStateDirectory != null) {
+        await engine.restoreDownloadState(downloadStateDirectory);
+      }
+    } catch (_) {
+      engine._b.destroySession(engine._session);
+      engine._disposed = true;
+      await engine._persistence.close();
+      await engine._torrentsCtrl.close();
+      await engine._streamsCtrl.close();
+      rethrow;
+    }
+    _instance = engine;
     engine._startPolling(pollInterval);
   }
 
@@ -264,23 +318,59 @@ class LibtorrentFlutter {
 
   // ─── Torrent Management ─────────────────────────────────────────────────────
 
+  /// Save selected download tasks and flushed resume data, never playback demands.
+  /// Binds this engine to one directory. Restore existing state before saving.
+  /// Completes after an atomic checkpoint; throws on I/O/native errors or timeout.
+  Future<void> saveDownloadState(String directory) {
+    _checkAlive();
+    return _persistence.save(directory);
+  }
+
+  /// Restore downloads (not streams), retaining live tasks with matching infohashes.
+  /// IDs are session-local. Missing payload is checked by libtorrent as needed.
+  /// Corrupt/unsupported state throws and is not silently overwritten.
+  Future<List<int>> restoreDownloadState(String directory) {
+    _checkAlive();
+    return _persistence.restore(directory);
+  }
+
+  /// Auto-save failures. Manual saves/dispose report failures through their Future.
+  Stream<Object> get downloadStateErrors => _persistence.errors.stream;
+
+  /// Find an existing task using v1/v2 hashes, independent of tracker/name ordering.
+  /// Returns null when absent; malformed magnets throw ArgumentError.
+  int? findTorrentByMagnet(String magnet) {
+    _checkAlive();
+    final uri = magnet.toNativeUtf8();
+    try {
+      final id = _b.findTorrentByMagnet(_session, uri);
+      if (id < 0) throw ArgumentError(_b.lastError().toDartString());
+      return id == 0 ? null : id;
+    } finally {
+      malloc.free(uri);
+    }
+  }
+
   /// Add a torrent from a magnet URI.
   ///
   /// Returns the torrent ID. [savePath] defaults to the path set in init().
-  /// Set [streamOnly] to true to download only pieces requested by streams.
+  /// Set [streamOnly] to true for playback-only selection initially.
+  /// [downloadFile] can add full-file download demands later.
   /// Multiple files can stream concurrently. Use [switchFile] when changing
-  /// episodes to clear old disk data while retaining the torrent ID/metadata.
-  /// Stopping the last stream with keepTorrent: true retains metadata only.
+  /// episodes to replace old streams while retaining connections and disk data.
+  /// Stopping a stream retains the torrent, connections and downloaded files.
   /// Adding the same torrent again returns its existing ID, preserving its
   /// save path and state. A different [streamOnly] mode throws. The returned
   /// ID is shared, not a separate task or reference-counted ownership token.
   int addMagnet(String magnetUri, [String? savePath, bool streamOnly = false]) {
+    _checkAlive();
     final enhanced = TrackerManager.injectTrackers(magnetUri);
     final m = enhanced.toNativeUtf8();
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
       final id = _b.addMagnet(_session, m, s, streamOnly ? 1 : 0);
       if (id < 0) throw Exception(_b.lastError().toDartString());
+      _persistence.changed();
       return id;
     } finally {
       malloc.free(m);
@@ -296,11 +386,13 @@ class LibtorrentFlutter {
     String? savePath,
     bool streamOnly = false,
   ]) {
+    _checkAlive();
     final f = filePath.toNativeUtf8();
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
       final id = _b.addTorrentFile(_session, f, s, streamOnly ? 1 : 0);
       if (id < 0) throw Exception(_b.lastError().toDartString());
+      _persistence.changed();
       return id;
     } finally {
       malloc.free(f);
@@ -311,6 +403,8 @@ class LibtorrentFlutter {
   /// Stop all associated streams and remove the torrent.
   /// Optionally delete downloaded files. Safe to call repeatedly.
   void removeTorrent(int id, {bool deleteFiles = false}) {
+    _checkAlive();
+    _persistence.beforeRemove(id);
     _b.removeTorrent(_session, id, deleteFiles ? 1 : 0);
     _streams.removeWhere((_, stream) => stream.torrentId == id);
     _streamsCtrl.add(Map.unmodifiable(_streams));
@@ -319,10 +413,18 @@ class LibtorrentFlutter {
   }
 
   /// Pause a torrent.
-  void pauseTorrent(int id) => _b.pauseTorrent(_session, id);
+  void pauseTorrent(int id) {
+    _checkAlive();
+    _b.pauseTorrent(_session, id);
+    _persistence.changed();
+  }
 
   /// Resume a paused torrent.
-  void resumeTorrent(int id) => _b.resumeTorrent(_session, id);
+  void resumeTorrent(int id) {
+    _checkAlive();
+    _b.resumeTorrent(_session, id);
+    _persistence.changed();
+  }
 
   /// Recheck torrent integrity.
   void recheckTorrent(int id) => _b.recheckTorrent(_session, id);
@@ -342,9 +444,61 @@ class LibtorrentFlutter {
     }
   }
 
+  /// Download and retain the whole selected file without interrupting playback.
+  /// Requires metadata. Repeated calls are idempotent. Selection survives seek,
+  /// switch and stop; configure downloadStateDirectory for restart recovery.
+  /// Use a durable savePath when adding the torrent; this does not move files.
+  void downloadFile(int torrentId, {required int fileIndex}) {
+    _checkAlive();
+    if (_b.downloadFile(_session, torrentId, fileIndex) == 0) {
+      throw StateError('downloadFile failed: ${_b.lastError().toDartString()}');
+    }
+    _persistence.changed();
+  }
+
+  /// Whether this task owns any full-file downloads, including completed ones.
+  /// Ordinary download magnets count before metadata arrives. Missing IDs do not.
+  bool hasDownloads(int torrentId) {
+    _checkAlive();
+    final result = _b.hasDownloads(_session, torrentId);
+    if (result < 0) {
+      throw StateError('hasDownloads failed: ${_b.lastError().toDartString()}');
+    }
+    return result != 0;
+  }
+
+  /// Snapshot of selected downloads. Progress counts verified bytes only.
+  /// Returns an empty list for absent tasks or unavailable metadata.
+  List<FileDownloadInfo> getFileDownloads(int torrentId) {
+    _checkAlive();
+    final count = _b.getFileCount(_session, torrentId);
+    if (count <= 0) return [];
+    final buf = calloc<LtFileDownloadStatus>(count);
+    try {
+      final result = _b.getFileDownloads(_session, torrentId, buf, count);
+      if (result < 0) {
+        throw StateError(
+            'getFileDownloads failed: ${_b.lastError().toDartString()}');
+      }
+      return List.generate(
+          result,
+          (i) => FileDownloadInfo(
+                fileIndex: buf[i].fileIndex,
+                fileSize: buf[i].fileSize,
+                verifiedBytes: buf[i].verifiedBytes,
+                priority: buf[i].priority,
+                isComplete: buf[i].isComplete != 0,
+              ));
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
   /// Set download priorities per file (0 = skip, 1-7 = priority levels).
-  /// Stop associated streams with keepTorrent: true before changing selection.
+  /// Replaces persistent download selection. Stop associated streams first.
+  /// Zero deselects a file without deleting bytes; downloadFile adds selection during playback.
   void setFilePriorities(int torrentId, List<int> priorities) {
+    _checkAlive();
     if (_streams.values.any((stream) => stream.torrentId == torrentId)) {
       throw StateError('Stop active streams before changing file priorities');
     }
@@ -355,6 +509,10 @@ class LibtorrentFlutter {
         buf[i] = priorities[i];
       }
       _b.setFilePriorities(_session, torrentId, buf, count);
+      final error = _b.lastError().toDartString();
+      if (error.isNotEmpty)
+        throw StateError('setFilePriorities failed: $error');
+      _persistence.changed();
     } finally {
       calloc.free(buf);
     }
@@ -370,12 +528,13 @@ class LibtorrentFlutter {
   /// Opens a stream without stopping existing streams or deleting data.
   /// Different files may stream concurrently, including in streamOnly mode.
   /// Their downloaded data is retained and may accumulate; use [switchFile]
-  /// to replace old streams and clear data when changing episodes.
+  /// to replace old streams and their download demands when changing episodes.
   StreamInfo startStream(
     int torrentId, {
     int fileIndex = -1,
     int maxCacheBytes = 0,
   }) {
+    _checkAlive();
     final streamId = _b.startStream(
       _session,
       torrentId,
@@ -385,17 +544,20 @@ class LibtorrentFlutter {
     return _registerStream(torrentId, streamId, 'startStream');
   }
 
-  /// Stop this torrent's streams, delete downloaded data, and open [fileIndex].
-  /// Keeps the torrent ID and metadata. Release the old player before calling;
+  /// Stop this torrent's streams and open [fileIndex] on the same torrent.
+  /// Keeps peer connections and downloaded data, withdrawing old stream demands
+  /// and prioritizing the new file's startup pieces. Data may accumulate on disk.
+  /// Release the old player before calling;
   /// no separate [stopStream] call is needed. The returned URL/ID replace the old
-  /// ones. File validation happens before cleanup, and cleanup failures throw.
-  /// [fileIndex] must be explicit (>= 0); even reselecting the same file resets
-  /// its downloaded data. Can also retry a previously failed episode cleanup.
+  /// ones. File validation happens before stopping the old streams.
+  /// [fileIndex] must be explicit (>= 0); reselecting the same file creates a new
+  /// stream while reusing its downloaded data and preserving full-file downloads.
   StreamInfo switchFile(
     int torrentId, {
     required int fileIndex,
     int maxCacheBytes = 0,
   }) {
+    _checkAlive();
     final streamId = _b.switchFile(
       _session,
       torrentId,
@@ -462,23 +624,21 @@ class LibtorrentFlutter {
     }
   }
 
-  /// Stop a stream. By default the last stream also removes its torrent
-  /// and deletes downloaded files, regardless of the streamOnly setting.
-  /// With [keepTorrent], streamOnly torrents retain metadata/ID but clear
-  /// disk data when their last stream stops. Ordinary torrents also retain data.
-  /// Other active streams of this torrent keep their task/data alive.
-  void stopStream(int streamId, {bool keepTorrent = false}) {
-    _b.stopStream(_session, streamId, keepTorrent ? 1 : 0);
+  /// Stop only this stream and withdraw its playback demands.
+  /// Retains the task/files; selected downloads continue. Use removeTorrent for
+  /// explicit cleanup. [keepTorrent] is ignored and retained for source compatibility.
+  void stopStream(int streamId, {bool keepTorrent = true}) {
+    _b.stopStream(_session, streamId, 1);
     final error = _b.lastError().toDartString();
     _streams.remove(streamId);
     _streamsCtrl.add(Map.unmodifiable(_streams));
-    // Reflect deletion or metadata-only retention immediately.
+    // Reflect the task after withdrawing playback demand.
     _pollTorrents();
     if (error.isNotEmpty) throw Exception('stopStream failed: $error');
   }
 
   // An episode switch may stop multiple native streams before returning,
-  // including when cleanup fails. Do not leave their URLs visible in Dart.
+  // including when new startup fails. Do not leave their URLs visible in Dart.
   void _removeStoppedStreams(int torrentId) {
     final ids = _streams.values
         .where((stream) => stream.torrentId == torrentId)
@@ -500,8 +660,9 @@ class LibtorrentFlutter {
     if (changed) _streamsCtrl.add(Map.unmodifiable(_streams));
   }
 
-  /// Stop all streams for a specific torrent, optionally retaining the task.
-  void stopAllStreamsForTorrent(int torrentId, {bool keepTorrent = false}) {
+  /// Stop all streams for a torrent, retaining files and download demands.
+  /// [keepTorrent] is ignored for compatibility, as in stopStream.
+  void stopAllStreamsForTorrent(int torrentId, {bool keepTorrent = true}) {
     final toStop = _streams.entries
         .where((e) => e.value.torrentId == torrentId)
         .map((e) => e.key)
@@ -740,7 +901,8 @@ class LibtorrentFlutter {
   }
 
   /// Clean up ALL torrents: stops every stream, removes every torrent,
-  /// deletes all downloaded files. Call this on your exit button.
+  /// deletes all downloaded files, including explicitly selected downloads.
+  /// This is an explicit delete-all action, not normal playback exit.
   void disposeAll() {
     _pollTorrents();
     for (final tid in _torrents.keys.toList()) {
@@ -748,15 +910,35 @@ class LibtorrentFlutter {
     }
   }
 
-  /// Shut down the engine entirely. Calls [disposeAll] first, then
-  /// destroys the native session. After this, you'd need to call
-  /// [init] again to use the engine.
-  Future<void> dispose() async {
-    if (_disposed) return;
-    disposeAll();
+  /// Save configured download state before destroying the engine. Download files
+  /// survive; temporary playback tasks are deleted. On save failure the engine
+  /// remains alive and dispose may be retried; explicit disposeAll deletes data.
+  Future<void> dispose() {
+    if (_disposed) return Future<void>.value();
+    return _disposeFuture ??= _dispose();
+  }
+
+  Future<void> _dispose() async {
+    _disposing = true;
+    try {
+      await _persistence.finish();
+    } catch (_) {
+      _disposing = false;
+      _disposeFuture = null;
+      _persistence.startTimer();
+      rethrow;
+    }
+    _disposing = false;
+    _pollTorrents();
+    for (final tid in _torrents.keys.toList()) {
+      if (!hasDownloads(tid)) removeTorrent(tid, deleteFiles: true);
+    }
     _pollTimer?.cancel();
     _disposed = true;
     _b.destroySession(_session);
+    _streams.clear();
+    _torrents.clear();
+    await _persistence.close();
     await _torrentsCtrl.close();
     await _streamsCtrl.close();
     _instance = null;

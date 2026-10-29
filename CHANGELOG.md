@@ -6,20 +6,24 @@ Historical entries describe their respective releases; see [README](README.md) f
 
 ## 2.0.1-dev.1 (unreleased)
 
+- Add `saveDownloadState`, `restoreDownloadState`, and infohash-based `findTorrentByMagnet`; restore downloads including completed files and ordinary magnets awaiting metadata.
+- Add `init(downloadStateDirectory:, downloadStateSaveInterval:)`, debounced/periodic checkpoints and `downloadStateErrors`. Await libtorrent resume alerts and atomically replace the state manifest; exclude playback priorities/deadlines.
+- Save before shutdown; retain the engine on checkpoint failure. Remove durable records before explicit deletion and reject stale concurrent snapshots. Validate corrupt state before restoration, preserve existing matching tasks and paused state. Rebuild native libraries for the new FFI exports.
+
 - Temporarily limit GitHub Actions to iOS builds during debugging; other platform jobs remain available but disabled.
 - Add `waitForStreamStart` with `StreamStartResult.ready/timeout/invalid`. Independently timed asynchronous waits check the selected file's first verified/readable piece; timeout retains the stream and permits retry, while stop/switch/removal/disposal invalidate old waits. Requires the new native `lt_check_stream_start` export.
-- Preserve up to 64 outgoing peer endpoint hints across episode cleanup, prioritizing seeds and retaining hints during rapid switches. Rebuilt torrents can reconnect without waiting for peer discovery; old payload/have-bits are still cleared.
+- **Reuse torrents on switching:** `switchFile` retains the torrent, peer connections and downloaded pieces, withdraws old stream demands and prioritizes the new startup pieces. It no longer deletes disk data or rebuilds the task; switching back reuses data and disk usage can accumulate. See cleanup policy changes below.
 - Translate libtorrent states explicitly to the public C/Dart enum; downloading was incorrectly labeled Finished, and completion of selected pieces was mislabeled Seeding.
-- Reuse the existing torrent ID when duplicate magnets or torrent files resolve to the same native handle. Preserve the original save path/state and reject conflicting `streamOnly` modes, preventing duplicate task aliases from blocking episode cleanup in `switchFile`.
+- Reuse the existing torrent ID when duplicate magnets or torrent files resolve to the same native handle. Preserve the original save path/state and reject conflicting `streamOnly` modes, preventing duplicate task aliases from sharing conflicting lifecycle policies.
 - Promote a missing piece blocking an HTTP read to an immediate deadline, even if it was already prefetched with a later playback deadline. This restores urgency when container probes or player buffering advance faster than the estimated playback rate.
 - Fix startup Range probes cancelling one another: each HTTP GET owns an independently merged download window and deadlines. Disconnects withdraw only their own demands; HEAD never changes playback state or scheduling. Range offsets no longer imply a user seek; status follows the first active GET.
 - Add opt-in HTTP Range/wait/completion diagnostics via `TB_LOG_FILE=stderr` or a writable file path. Native regression coverage includes HEAD isolation, concurrent probes, shared-piece delivery and disconnect/removal cleanup.
-- Add `stopStream(..., keepTorrent: false)` and the same option to `stopAllStreamsForTorrent`. The last stream deletes its task/files by default in both modes.
-- **Explicit episode policy:** `streamOnly=true` controls on-demand downloading; `switchFile` controls replacement and cleanup. Use `startStream` to open the first stream and `switchFile` to explicitly stop old streams, wait for payload/partfile deletion, and start with fresh owned-piece state under the same torrent ID and metadata. `startStream` allows different files to stream concurrently in both modes; it never implicitly switches or cleans up, so downloaded data may accumulate. Stopping the last stream with `keepTorrent: true` keeps metadata only. BT peers reconnect when changing episodes.
-- **Ordinary download compatibility:** `streamOnly=false` callers must explicitly pass `keepTorrent: true` to retain downloaded data after stopping. The example's Stop Stream action has been updated. Retention no longer restores all-file downloading.
+- **Breaking cleanup change:** stop APIs withdraw only playback demands and retain tasks/files. `keepTorrent` remains accepted but is ignored. Deletion requires explicit `removeTorrent`, `disposeTorrent` or `disposeAll`.
+- **Explicit episode policy:** use `startStream` initially and `switchFile` to replace all old streams while retaining data. `startStream` allows different files to stream concurrently in both modes and never implicitly switches or cleans up. Downloaded data remains reusable and uploadable.
+- Add `downloadFile`, `hasDownloads`, `getFileDownloads` and `FileDownloadInfo`. C++ merges per-file download baselines with playback demands; seeks, switches and stops preserve downloads. Ordinary tasks retain file selection; progress counts verified bytes and requires complete boundary pieces.
 - Merge per-stream priorities/deadlines and fan out piece alerts for simultaneous streams of the same or different files in both download modes. Serialize lifecycle operations; direct `removeTorrent` stops all associated streams without recursive deletion.
-- Propagate episode-cleanup failures to Dart, preserve metadata for retry, and remove stopped stream URLs from Dart immediately after explicit switching.
-- Require rebuilt native artifacts exporting `lt_stop_stream_ex` and `lt_switch_file`; the legacy native stop entry point uses the default delete policy.
+- `dispose()` retains files for selected downloads, including completed tasks, and deletes temporary tasks. Remove destructive stop/rebuild machinery.
+- Rebuild matching native artifacts with `lt_download_file`, `lt_has_downloads` and `lt_get_file_downloads`. The legacy native stop entry point also stops only the stream.
 
 - Port bounded piece caches and sliding stream windows from fork commits `586a129` and `88eb0ab`, retaining owned buffers and 2.0.0 Android/Range fixes.
 - Restore file sizes in the FFI file list and verify existing local files when no resume state is supplied.

@@ -152,14 +152,10 @@ final bool active = engine.isStreaming(id);
 // Get info for a specific stream
 final StreamInfo? info = engine.getStreamInfo(streamId);
 
-// Stop a stream; the last stream removes its torrent and downloaded files.
-engine.stopStream(streamId); // keepTorrent defaults to false
-
-// Keep the torrent ID and metadata; streamOnly tasks clear stopped-episode data.
-engine.stopStream(streamId, keepTorrent: true);
-
-// Stop all streams, optionally retaining the torrent.
-engine.stopAllStreamsForTorrent(torrentId, keepTorrent: true);
+// Stop playback only; files and selected downloads survive.
+engine.stopStream(streamId);
+engine.stopAllStreamsForTorrent(torrentId);
+// keepTorrent is accepted for compatibility but ignored, even when false.
 ```
 
 `readHead` follows the first active HTTP GET; when it ends, another active GET
@@ -184,8 +180,8 @@ library/XCFramework from the updated source; Flutter hot reload is insufficient.
 ### Episode switching and upload
 
 `streamOnly` is the third positional argument. Set it to `true` for on-demand
-downloading. Use `switchFile` for episode changes to retain only the new episode's
-data. Verified pieces can upload while playing, including after download completes.
+downloading. Use `switchFile` for episode changes to replace old stream demands
+while retaining the torrent, connections and downloaded data. Verified pieces can upload while playing, including after download completes.
 
 ```dart
 final torrentId = engine.addMagnet(magnetUri, null, true);
@@ -193,7 +189,7 @@ final torrentId = engine.addMagnet(magnetUri, null, true);
 final first = engine.startStream(torrentId, fileIndex: firstFileIndex);
 // Play first.url. When switching, release the old player first.
 final next = engine.switchFile(torrentId, fileIndex: nextFileIndex);
-// switchFile stops the old episode and clears its disk data; no stopStream needed.
+// switchFile stops old streams and changes priorities; no stopStream needed.
 // Play next.url. On final exit, release the player and clean up:
 engine.removeTorrent(torrentId, deleteFiles: true);
 ```
@@ -213,7 +209,7 @@ switch (result) {
     break;
   case StreamStartResult.timeout:
     // Keep next.id/next.url. Show a retry action which waits on next.id again.
-    // Do not call switchFile again: that would delete the data just downloaded.
+    // Retry the wait on this ID; switchFile would replace the stream and URL.
     break;
   case StreamStartResult.invalid:
     // The stream was stopped/replaced/removed, or the engine was disposed.
@@ -238,52 +234,136 @@ that ID affects all its streams.
 
 `startStream` only opens a stream; it never deletes data or stops other streams.
 It allows different files to stream simultaneously in both download modes. Their
-downloaded data is retained and may accumulate. Use `switchFile` for episode
-changes when old streams and data should be cleared.
+downloaded data is retained and may accumulate. Use `switchFile` to replace all
+old streams with one new stream.
 
-`switchFile` ends all streams of the specified torrent, deletes its downloaded data (including partial data in libtorrent's partfile),
-and resets the owned-piece state before the next episode starts. The torrent ID,
-metadata, file list and discovery settings are retained. Up to 64 known outgoing
-peer endpoints are retained (preferring connected seeds) and supplied to the new
-torrent for reconnection without waiting for discovery. These are connection
-hints, not preserved sockets or a guarantee that a peer remains reachable.
-BT connections reconnect;
-the magnet metadata does not need to be downloaded again. After a switch only the
-new stream remains. Repeated `switchFile` calls retain the current episode's data,
-not ten episodes after ten switches. Repeated `startStream` calls keep old streams
-and data instead. BT pieces can straddle file boundaries, so a small amount of adjacent
-file data may be needed to verify the current episode's boundary pieces; it is
-cleared on the next switch too. This is separate from `maxCacheBytes`, which
-limits the RAM cache.
+`switchFile` reuses the existing torrent handle, scheduler, peer connections and
+verified disk pieces (including partfile data). It withdraws the old streams'
+priorities/deadlines and gives the selected file's startup pieces immediate
+priority. Missing pieces with neither playback nor full-file download demand become unwanted;
+verified pieces remain available for upload. In-flight blocks can still arrive.
+Switching does not pause, remove, recheck or rebuild the torrent.
 
-You can also stop before choosing the next episode:
+Previously downloaded episodes and boundary pieces remain on disk and can be
+reused when switching back. `maxCacheBytes` only limits the RAM piece cache;
+there is no disk eviction on switching. `switchFile` requires an explicit,
+nonnegative file index and validates it before stopping the old streams. Selecting
+the same file also creates a new stream/URL, while retaining its downloaded data.
+These switching semantics apply to both `streamOnly` modes; selected full-file
+downloads retain their baseline priority after playback demands are withdrawn.
+
+Call `switchFile` directly when changing episodes; no separate `stopStream` is
+needed. Both APIs preserve disk data. `stopStream` withdraws only playback demand,
+so selected file downloads continue even when there are no active streams.
+
+### Cache the current episode while playing
+
+Use a durable application directory as `savePath` when adding the torrent. The
+following methods require metadata; `downloadFile` does not move existing files.
 
 ```dart
-engine.stopStream(currentStream.id, keepTorrent: true);
-// The last stream's data is cleared; only paused metadata/ID remain.
-final next = engine.startStream(torrentId, fileIndex: nextFileIndex);
+// Click "Cache this episode". Repeated calls do not create duplicate downloads.
+engine.downloadFile(torrentId, fileIndex: currentIndex);
+
+// Switch without cancelling the original episode's download.
+final next = engine.switchFile(torrentId, fileIndex: nextIndex);
+
+// File snapshots count verified bytes only; progress is 0..1.
+final downloads = engine.getFileDownloads(torrentId);
+for (final file in downloads) {
+  print('${file.fileIndex}: ${file.progress * 100}% complete=${file.isComplete}');
+}
+
+// Exit playback. Completed downloads still count as retained selections.
+engine.stopStream(next.id);
+if (!engine.hasDownloads(torrentId)) {
+  engine.removeTorrent(torrentId, deleteFiles: true);
+}
 ```
 
-Cleanup waits for libtorrent's disk-deletion completion before starting new disk
-writes. If deletion fails or exceeds 30 seconds, playback does not start and the
-call throws; fix the storage problem and retry `switchFile` with the same ID.
-`switchFile` requires an explicit, nonnegative file index and validates it before
-stopping the old episode. Even switching to the same file clears downloaded data
-and starts a fresh stream. It can also be used for ordinary download torrents;
-that explicit call replaces all streams and clears the torrent's downloaded data.
-`removeTorrent` remains the final cleanup path and stops all associated streams.
-Release player objects separately. Final removal uses libtorrent's asynchronous
-deletion; episode switching waits for deletion to finish.
+C++ retains each selected file's download demand independently of playback.
+Every missing piece of that file receives baseline priority 4; urgent playback
+pieces can rise to 7 with deadlines. Seeking/switching/stopping withdraws only
+playback demand, falling back to the download baseline instead of zero. Priorities
+are scheduling preferences, not guaranteed bandwidth. Skipped middle sections
+continue downloading; a file completes only when every required piece is verified.
+Shared boundary pieces count only the bytes belonging to each file.
 
-**Compatibility:** `keepTorrent` defaults to `false`; stopping the last stream
-removes the entire task/files in both modes. With `streamOnly=false`, explicit
-`keepTorrent: true` retains downloaded data and supports different simultaneous
-files. With `streamOnly=true`, it now retains metadata only after the last stream
-stops; use `switchFile` for bounded episode storage. Retention does not enable all-file
-background downloading. Rebuild native libraries with this Dart package: the FFI
-entry points are `lt_stop_stream_ex` and `lt_switch_file`; older binaries do not
-implement this behavior. Callers of the earlier automatic-switching implementation
-must replace episode-changing `startStream` calls with `switchFile`.
+`streamOnly=false` tasks retain their original file download selection while
+playing. `setFilePriorities` replaces that selection (stop active streams first);
+zero deselects a file without deleting bytes. `downloadFile` adds a selection
+during playback and raises its baseline to at least 4. A selected/completed file
+keeps the task eligible for retention until deselected or explicitly removed.
+Other temporarily played episodes in that torrent are retained on disk too;
+per-file disk deletion and automatic disk quotas are not implemented.
+
+**Breaking cleanup change:** `stopStream` and `stopAllStreamsForTorrent` never
+delete tasks/files. `keepTorrent` remains accepted but is ignored, including
+`false`. Replace former automatic cleanup with explicit `removeTorrent` calls.
+`dispose()` preserves files for download tasks and removes temporary tasks;
+`disposeTorrent`/`disposeAll` explicitly delete selected downloads too. Release
+player objects separately. File deletion is asynchronous in libtorrent.
+
+### Download persistence and restart recovery
+
+Use durable application directories for **both** payload files and task state:
+
+```dart
+await LibtorrentFlutter.init(
+  defaultSavePath: downloadDirectory,
+  downloadStateDirectory: stateDirectory,
+  downloadStateSaveInterval: const Duration(seconds: 30),
+);
+// init finishes restoring downloads before exposing the singleton.
+final engine = LibtorrentFlutter.instance;
+final errorSubscription = engine.downloadStateErrors.listen((error) {
+  debugPrint('Download checkpoint failed: $error');
+});
+
+// Reuse a restored task, regardless of magnet tracker/name ordering.
+final torrentId = engine.findTorrentByMagnet(magnet) ??
+    engine.addMagnet(magnet, downloadDirectory, true);
+final stream = engine.startStream(torrentId, fileIndex: currentIndex);
+
+engine.downloadFile(torrentId, fileIndex: currentIndex);
+await engine.saveDownloadState(stateDirectory); // explicit durable checkpoint
+
+// Shutdown saves downloads before destroying the native session.
+await errorSubscription.cancel();
+await engine.dispose();
+```
+
+If initialization does not configure a state directory, call
+`await engine.restoreDownloadState(stateDirectory)` **before opening playback**.
+It returns the current session's restored task IDs; IDs are not stable across
+restarts. Repeated restoration is idempotent and existing tasks with matching
+v1/v2 infohashes retain their live selection. Do not add the magnet again to
+obtain a second playback/download task. One engine binds to one state directory;
+only one engine/process should write that directory.
+
+`saveDownloadState(directory)` waits for libtorrent's asynchronous disk flush and
+resume-data alerts, then atomically replaces `downloads.json`. It saves metadata,
+save paths, verified progress, download selection and pause state. HTTP streams,
+playback deadlines and temporary playback-only tasks are excluded. Checkpoints
+run after selection/task changes (debounced) and every 30 seconds by default.
+Calling save/restore manually also enables these automatic checkpoints.
+
+`removeTorrent` synchronously removes its durable task record before native
+removal, even with `deleteFiles: false`. A concurrent save cannot resurrect it.
+`disposeTorrent`/`disposeAll` use the same path. `stopStream` retains the download
+and its state. A failed state-file update throws and prevents task removal.
+
+Missing payload or stale resume data is checked by libtorrent as needed; corrupt
+or unsupported state is reported instead of silently replaced. Manual saves and
+`dispose()` report errors through their Future (30-second native snapshot wait
+budget); automatic errors arrive on `downloadStateErrors`. If the final save
+fails, the engine remains alive so shutdown can be retried. A process killed
+before a checkpoint can lose recent task changes/progress; periodic saving does
+not imply continued downloading while iOS suspends the app. Payload paths are
+stored as supplied; relocating downloads/app containers is not handled here.
+
+Rebuild the native library/XCFramework with the new resume and lookup exports.
+Flutter hot reload cannot update native behavior.
 
 ### Cleanup
 
@@ -291,10 +371,10 @@ must replace episode-changing `startStream` calls with `switchFile`.
 // Clean up one torrent: stops its streams, removes it, deletes the files
 engine.disposeTorrent(id);  // returns false if already gone
 
-// Clean up everything — perfect for your exit button
+// Explicitly delete all torrents/files, including selected downloads
 engine.disposeAll();
 
-// Full shutdown — calls disposeAll(), destroys native session
+// Shutdown — retains download files, removes temporary tasks, closes the session
 await engine.dispose();
 ```
 

@@ -151,15 +151,10 @@ final bool active = engine.isStreaming(id);
 // 获取指定流的状态快照
 final StreamInfo? info = engine.getStreamInfo(streamId);
 
-// 默认 keepTorrent=false：停止最后一个流时删除任务及下载文件。
+// 只停止播放，保留任务和文件，已选择缓存的集继续下载。
 engine.stopStream(streamId);
-
-// 保留任务 ID 和元数据。
-// streamOnly 任务在最后一个流停止时会清理已下载的分集数据。
-engine.stopStream(streamId, keepTorrent: true);
-
-// 停止某个任务的全部流，并选择是否保留任务。
-engine.stopAllStreamsForTorrent(torrentId, keepTorrent: true);
+engine.stopAllStreamsForTorrent(torrentId);
+// keepTorrent 仅保留参数兼容，即使传 false 也不再删除任务。
 ```
 
 `bufferPct` 的范围是 0～1，显示百分比时乘以 100；它表示前向缓冲窗口的完成比例，不是整个文件的下载进度。
@@ -176,7 +171,7 @@ Range 位置变化不会再自动产生 `seeking` 状态，因为服务端无法
 
 ### 合集切集与上传
 
-`streamOnly` 是第三个位置参数，传 `true` 表示按需下载。切集使用 `switchFile`，以清理旧集数据。已经下载并校验的分片可以在播放期间上传，当前集下载完成后也能继续上传。
+`streamOnly` 是第三个位置参数，传 `true` 表示按需下载。切集使用 `switchFile`，替换旧流需求并保留 torrent、连接和已下载数据。已经下载并校验的分片可以在播放期间上传，当前集下载完成后也能继续上传。
 
 ```dart
 final torrentId = engine.addMagnet(magnetUri, null, true);
@@ -186,7 +181,7 @@ final first = engine.startStream(torrentId, fileIndex: firstFileIndex);
 
 // 切集前，先让播放器停止使用旧 URL。
 final next = engine.switchFile(torrentId, fileIndex: nextFileIndex);
-// switchFile 会停止旧流并清理磁盘数据，不必另调 stopStream。
+// switchFile 停止旧流并调整优先级，不必另调 stopStream。
 // 播放 next.url。
 
 // 最终退出时，释放播放器并清理任务。
@@ -207,7 +202,7 @@ switch (result) {
     break;
   case StreamStartResult.timeout:
     // 保留 next.id 和 next.url，允许再次等待同一个 next.id。
-    // 不要再次 switchFile，否则会清掉刚下载的数据。
+    // 重试等待同一个 ID 即可；再次 switchFile 会替换流及 URL。
     break;
   case StreamStartResult.invalid:
     // 流已被停止、替换、删除，或引擎已销毁。
@@ -228,27 +223,96 @@ switch (result) {
 
 磁力链接添加一次即可，切集时复用 `torrentId`。重复 `addMagnet`／`addTorrentFile` 添加同一 torrent 会返回已有 ID，保留原保存路径和状态；`streamOnly` 模式冲突时抛错。这是同一个任务，不是多个独立所有权引用，切换或删除该 ID 会影响它的全部流。
 
-`startStream` 只开流，不隐式停掉旧流或删除数据。两种下载模式都允许同时播放不同文件，因此重复开流可能使下载文件累积。需要清理旧集时，显式使用 `switchFile`。
+`startStream` 只开流，不隐式停掉旧流或删除数据。两种下载模式都允许同时播放不同文件，因此重复开流可能使下载文件累积。使用 `switchFile` 可以停止全部旧流，替换为一个新流。
 
-`switchFile` 会停止该 torrent 的全部流，删除下载数据（包括 libtorrent 的 partfile 中的部分数据），并在新集开始前重建“已拥有分片”状态。任务 ID、元数据、文件列表和发现配置保留；最多保留 64 个已知的主动连接 peer 地址，优先选取已连接的 seed，并交给新 torrent 尝试重连。这些只是重连地址，不是保留旧连接，也不保证 peer 仍可访问。
+`switchFile` 复用已有 torrent handle、调度器、peer 连接和已校验的磁盘分片（包括 partfile 数据）。它撤销旧流的优先级和 deadline，并优先调度新文件的启动分片。既没有播放需求、也没有完整下载需求的缺失分片优先级归零；已校验的分片仍可上传。已在传输中的数据块可能继续到达。切集不会暂停、删除、重新校验或重建 torrent。
 
-切集需要重新建立 BT 连接，但无需重新下载磁力元数据。切换后只保留新流及当前集数据，不会因为看了十集就保留十集文件。BT 分片可能跨越文件边界，因此校验当前集边界分片时，可能需要少量相邻文件数据；下次切集时也会清理。磁盘数据策略与 `maxCacheBytes` 的内存限制相互独立。
+此前下载的集和边界分片会保留在磁盘上，切回时可以复用。`maxCacheBytes` 只限制内存分片缓存，切集不再淘汰磁盘数据。`switchFile` 要求明确、非负的文件下标，在停止旧流之前校验；切到同一个文件也会创建新流和 URL，但复用已下载数据。两种 `streamOnly` 模式采用相同切集行为，已选择缓存的集在撤销播放需求后仍保留下载基础优先级。
 
-也可以先停流，再选择下一集：
+切集直接调用 `switchFile`，不必另调 `stopStream`。两个接口都保留磁盘数据；停止播放只撤销播放需求，没有活动流时，已选择缓存的文件仍会继续下载。
+
+### 播放途中缓存当前集
+
+添加磁力时应使用应用持久目录作为 `savePath`。以下接口需要元数据；`downloadFile` 不会迁移已有文件。
 
 ```dart
-engine.stopStream(currentStream.id, keepTorrent: true);
-// streamOnly 任务的最后一个流停止后，清理下载数据，只保留暂停的元数据任务和 ID。
-final next = engine.startStream(torrentId, fileIndex: nextFileIndex);
+// 用户点击“缓存当前集”，重复调用不重复创建下载。
+engine.downloadFile(torrentId, fileIndex: currentIndex);
+
+// 切集后，上一集仍继续完整下载。
+final next = engine.switchFile(torrentId, fileIndex: nextIndex);
+
+// 文件进度只统计已校验的字节；progress 为 0..1。
+final downloads = engine.getFileDownloads(torrentId);
+for (final file in downloads) {
+  print('${file.fileIndex}: ${file.progress * 100}% 完成=${file.isComplete}');
+}
+
+// 退出播放；已经下载完成的缓存也算需要保留的下载需求。
+engine.stopStream(next.id);
+if (!engine.hasDownloads(torrentId)) {
+  engine.removeTorrent(torrentId, deleteFiles: true);
+}
 ```
 
-切集会等待 libtorrent 完成磁盘删除后再启动新的磁盘写入。删除失败或等待超过 30 秒时，不启动新流并抛出异常；解决存储问题后，可用同一个任务 ID 重试 `switchFile`。
+C++ 按文件记录完整下载需求，独立于播放流。缓存文件的所有缺失分片保持基础优先级 4，播放急需分片可提升到 7 并设置 deadline。拖动、切集、停流只撤销播放需求，回退到下载基础优先级而不是归零。优先级不保证固定带宽。跳过的中间部分仍会补齐，所有所需分片校验完成才算文件下载完成；跨文件边界分片的进度只统计属于该文件的字节。
 
-`switchFile` 要求明确、非负的文件下标，并在停止旧集之前校验。即便切换到同一个文件，也会清除已下载数据并创建新流。普通下载任务也可以调用它，但同样会替换全部流并清理该 torrent 的下载数据。
+`streamOnly=false` 的普通下载任务在播放时也保留原文件选择。`setFilePriorities` 替换完整下载选择（需先停流），设为 0 只取消选择，不删除数据；播放期间可用 `downloadFile` 追加缓存文件，将其基础优先级至少提高到 4。完成后的文件仍保留下载选择，直到取消选择或显式删除。这个 torrent 中临时播放过的其他集也仍在磁盘上，暂不实现分集物理删除或磁盘容量自动淘汰。
 
-最终清理使用 `removeTorrent`，它会停止全部关联流。播放器对象由调用方单独释放。最终删除文件是 libtorrent 的异步操作；切集则会等待删除完成。
+**清理兼容性变更：** `stopStream`、`stopAllStreamsForTorrent` 不再删除任务和文件。`keepTorrent` 仅保留参数兼容，即使传 `false` 也会被忽略。原先依赖停流自动清理的调用方，需要改为显式调用 `removeTorrent`。`dispose()` 保留下载任务文件、删除临时任务；`disposeTorrent`、`disposeAll` 仍是显式删除入口，也会删除用户选择的缓存文件。播放器需单独释放；libtorrent 文件删除是异步操作。
 
-**兼容性说明：** `keepTorrent` 默认是 `false`，两种模式下停止最后一个流都会删除任务及文件。`streamOnly=false` 时显式传 `keepTorrent: true` 会保留下载数据；`streamOnly=true` 时只保留元数据和 ID。保留任务不会自动开启全文件后台下载。需要与当前 Dart 包配套的 `lt_stop_stream_ex`、`lt_switch_file` 原生导出；旧二进制不支持这些语义。曾依赖早期自动切集实现的调用方，应将用于切集的 `startStream` 改为 `switchFile`。
+### 下载任务持久化与重启恢复
+
+**下载文件和任务记录都应使用应用持久目录**，不要使用系统临时目录：
+
+```dart
+await LibtorrentFlutter.init(
+  defaultSavePath: downloadDirectory,
+  downloadStateDirectory: stateDirectory,
+  downloadStateSaveInterval: const Duration(seconds: 30),
+);
+// init 返回时已完成任务恢复，随后才能访问 instance。
+final engine = LibtorrentFlutter.instance;
+final errorSubscription = engine.downloadStateErrors.listen((error) {
+  debugPrint('下载状态保存失败：$error');
+});
+
+// 按 infohash 复用已恢复任务，不受磁力名称、tracker 顺序影响。
+final torrentId = engine.findTorrentByMagnet(magnet) ??
+    engine.addMagnet(magnet, downloadDirectory, true);
+final stream = engine.startStream(torrentId, fileIndex: currentIndex);
+
+engine.downloadFile(torrentId, fileIndex: currentIndex);
+await engine.saveDownloadState(stateDirectory); // 需要确认落盘时显式等待
+
+// 退出时先保存下载任务，再销毁原生会话。
+await errorSubscription.cancel();
+await engine.dispose();
+```
+
+如果 `init` 没有配置状态目录，可在**进入播放界面前**调用
+`await engine.restoreDownloadState(stateDirectory)`，返回本次会话的任务 ID 列表。
+`torrentId` 不保证跨重启稳定；恢复不会重建播放流。重复恢复不会新增重复任务；
+若已有相同 v1/v2 infohash 的任务，保留其当前下载选择。播放时复用任务即可，
+无需再次 `addMagnet` 创建另一份下载任务。一个引擎会话绑定一个状态目录，
+同一目录应仅由一个引擎／进程写入。
+
+`saveDownloadState(directory)` 等待 libtorrent 异步刷盘和恢复数据回调，随后原子替换
+`downloads.json`。保存内容包括元数据、下载路径、分片进度、下载文件选择和暂停状态；
+不保存播放流、播放 deadline 和纯播放临时任务。任务／下载选择变化后会合并触发保存，
+默认每 30 秒定期保存进度。手动调用保存／恢复方法后也会启用自动保存。
+
+`removeTorrent` 会先同步删除持久化记录，再移除原生任务，`deleteFiles: false` 也一样；
+并发保存不会让已删除任务重现。`disposeTorrent`／`disposeAll` 使用同一路径。
+`stopStream` 保留下载及其记录。记录删除写盘失败时抛出异常，不继续删除任务。
+
+文件缺失、旧恢复数据与磁盘不符时由 libtorrent 按需校验；记录损坏或版本不支持时显式报错，
+不会静默覆盖。手动保存和 `dispose()` 通过 Future 抛错（原生快照等待预算为 30 秒），
+自动保存失败通过 `downloadStateErrors` 通知。退出前保存失败时引擎仍有效，可重试退出。
+进程在保存完成前被杀死，可能丢失最近的任务变更／进度；定期保存不代表 iOS 挂起后仍可持续下载。
+下载路径按原值保存，本阶段不处理下载目录／应用容器迁移。
+
+需要重新编译包含恢复与查询接口的原生库／iOS XCFramework，Flutter 热重载无法更新原生行为。
 
 ### 清理
 
@@ -256,10 +320,10 @@ final next = engine.startStream(torrentId, fileIndex: nextFileIndex);
 // 清理一个任务：停止关联流、删除任务及文件；任务已不存在时返回 false。
 engine.disposeTorrent(id);
 
-// 清理全部任务和流。
+// 显式删除全部任务和文件，包括用户选择的缓存。
 engine.disposeAll();
 
-// 完全关闭：先 disposeAll，再销毁原生 session。
+// 关闭引擎：保留下载文件、清理临时任务，再销毁 session。
 await engine.dispose();
 ```
 

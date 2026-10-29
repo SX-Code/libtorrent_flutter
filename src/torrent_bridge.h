@@ -68,6 +68,15 @@ typedef struct {
     int32_t is_streamable;
 } lt_file_info;
 
+/* Verified file bytes; no partial/unverified blocks count toward completion. */
+typedef struct {
+    int64_t file_size;
+    int64_t verified_bytes;
+    int32_t file_index;
+    int32_t priority;
+    int32_t is_complete;
+} lt_file_download_status;
+
 typedef struct {
     lt_stream_id  id;
     lt_torrent_id torrent_id;
@@ -139,6 +148,17 @@ TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
                                               const char* file_path,
                                               const char* save_path,
                                               int stream_only);
+/* Non-blocking resume capture: request 1=started, 0=previous still pending, -1=error.
+ * Read 0=pending, -1=error, positive=required buffer size (copy if capacity fits).
+ * Restore returns an existing/new ID, -1=error. Find returns 0=absent, -1=error.
+ * Magnet string is thread-local and valid until the next call on that thread. */
+TORRENT_API int lt_request_resume_data(lt_session_t session, lt_torrent_id id);
+TORRENT_API int lt_read_resume_data(lt_session_t session, lt_torrent_id id, char* out, int capacity);
+TORRENT_API lt_torrent_id lt_validate_resume_data(lt_session_t session, const char* data, int size);
+TORRENT_API lt_torrent_id lt_restore_resume_data(lt_session_t session, const char* data, int size);
+TORRENT_API lt_torrent_id lt_find_torrent_by_magnet(lt_session_t session, const char* magnet);
+TORRENT_API const char* lt_get_torrent_magnet(lt_session_t session, lt_torrent_id id);
+
 TORRENT_API void lt_remove_torrent(lt_session_t session,
                                    lt_torrent_id id, int delete_files);
 TORRENT_API void lt_pause_torrent(lt_session_t session, lt_torrent_id id);
@@ -159,20 +179,28 @@ TORRENT_API int  lt_get_files(lt_session_t session, lt_torrent_id id,
 TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
                                         const int32_t* priorities, int count);
 
+/* Persistent file selection within this session. Requires metadata.
+ * download_file: 1=success, 0=error. has_downloads: 1=yes, 0=no, -1=error.
+ * get_file_downloads: selected file count, or -1=error. See lt_last_error(). */
+TORRENT_API int lt_download_file(lt_session_t session, lt_torrent_id id, int file_index);
+TORRENT_API int lt_has_downloads(lt_session_t session, lt_torrent_id id);
+TORRENT_API int lt_get_file_downloads(lt_session_t session, lt_torrent_id id,
+                                     lt_file_download_status* out, int max_count);
+
 /* streaming */
 TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                                          lt_torrent_id torrent_id,
                                          int file_index,
                                          int64_t max_cache_bytes);
-/* Stop all streams and clear downloaded data before opening the selected file.
- * Retains the torrent ID and metadata. file_index must be explicit (>= 0).
+/* Replace all streams, withdrawing old demands and prioritizing the new file.
+ * Retains the torrent, connections and disk data. file_index must be explicit (>= 0).
  * Returns the new stream ID, or -1 with lt_last_error() on failure. */
 TORRENT_API lt_stream_id lt_switch_file(lt_session_t session,
                                         lt_torrent_id torrent_id,
                                         int file_index,
                                         int64_t max_cache_bytes);
 TORRENT_API void         lt_stop_stream(lt_session_t session, lt_stream_id id);
-/* keep_torrent=0 removes the torrent/files only when its last stream stops. */
+/* Stops only the stream. keep_torrent is ignored, retained for ABI compatibility. */
 TORRENT_API void         lt_stop_stream_ex(lt_session_t session, lt_stream_id id, int keep_torrent);
 /* Non-blocking startup probe: 1=verified/readable first piece, 0=pending,
  * -1=invalid stream/session, -2=unexpected native error (lt_last_error).

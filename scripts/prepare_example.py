@@ -21,6 +21,8 @@ tests = example / 'integration_test'
 tests.mkdir(exist_ok=True)
 shutil.copyfile(root / 'test/integration/engine_smoke.dart', tests / 'engine_test.dart')
 shutil.copyfile(root / 'test/integration/stream_start_checks.dart', tests / 'stream_start_checks.dart')
+shutil.copyfile(root / 'test/integration/file_download_checks.dart', tests / 'file_download_checks.dart')
+shutil.copyfile(root / 'test/integration/download_state_checks.dart', tests / 'download_state_checks.dart')
 if args.platform == 'macos':
     for name in ['DebugProfile', 'Release']:
         path = example / 'macos/Runner' / (name + '.entitlements')
