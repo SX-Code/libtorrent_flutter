@@ -2979,7 +2979,9 @@ TORRENT_API int lt_get_all_statuses(lt_session_t session,
         if (n >= max) break;
         if (!kv.second.is_valid()) continue;
         try {
-            lt::torrent_status st = kv.second.status(lt::torrent_handle::query_pieces);
+            // save_path is populated only when explicitly requested by status flags.
+            lt::torrent_status st = kv.second.status(
+                lt::torrent_handle::query_pieces | lt::torrent_handle::query_save_path);
             fill_status(out[n], kv.first, st);
             n++;
         } catch (...) {}
@@ -2995,7 +2997,8 @@ TORRENT_API int lt_get_status(lt_session_t session, lt_torrent_id id,
     auto it = sw->handles.find(id);
     if (it == sw->handles.end() || !it->second.is_valid()) return 0;
     try { fill_status(*out, id,
-          it->second.status(lt::torrent_handle::query_pieces)); return 1; } catch (...) { return 0; }
+          it->second.status(lt::torrent_handle::query_pieces |
+                            lt::torrent_handle::query_save_path)); return 1; } catch (...) { return 0; }
 }
 
 // ── file queries ────────────────────────────────────────────────────────────────
