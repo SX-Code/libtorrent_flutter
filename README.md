@@ -395,6 +395,17 @@ v1/v2 infohashes retain their live selection. Do not add the magnet again to
 obtain a second playback/download task. One engine binds to one state directory;
 only one engine/process should write that directory.
 
+Playback and caching keep disk files enabled from torrent creation. The scheduler
+controls piece priorities separately: playback requests its window, while caching
+adds a whole-file baseline. Adding or cancelling caching does not change disk file
+priorities or export a partfile while playback is reading it. Use
+`getFileDownloads` to query business selections, not raw file storage priorities.
+
+Native resume snapshots use version 3, with download selections stored separately
+from disk file priorities. Versions 1 and 2 are rejected; no old-cache migration is
+provided. Rebuild the native library and restart the engine to use this policy;
+it does not repair torrents already in a disk-error state.
+
 `saveDownloadState(directory)` waits for libtorrent's asynchronous disk flush and
 resume-data alerts, then atomically replaces `downloads.json`. It saves metadata,
 save paths, verified progress, download selection and pause state. HTTP streams,

@@ -865,10 +865,10 @@ class StreamScheduler {
 public:
     explicit StreamScheduler(lt::torrent_handle handle, bool ordinary_download = false) : handle_(handle) {
         const auto ti = handle_.torrent_file();
-        file_priorities_.assign(size_t(ti->num_files()), lt::dont_download);
+        download_selection_.assign(size_t(ti->num_files()), lt::dont_download);
         if (ordinary_download) {
-            file_priorities_ = handle_.get_file_priorities();
-            file_priorities_.resize(size_t(ti->num_files()), lt::default_priority);
+            download_selection_ = handle_.get_file_priorities();
+            download_selection_.resize(size_t(ti->num_files()), lt::default_priority);
         }
         rebuild_base_locked();
     }
@@ -876,37 +876,35 @@ public:
     // A file selection owns a baseline independently of HTTP readers/streams.
     void download_file(int index) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto& priority = file_priorities_.at(size_t(index));
+        auto& priority = download_selection_.at(size_t(index));
         if (priority >= lt::default_priority) return;
         priority = lt::default_priority;
         rebuild_base_locked();
-        // Materialize selected files instead of leaving their bytes in partfile.
-        // file_prio_alert reapplies the aggregate after this async disk operation.
-        handle_.prioritize_files(file_priorities_);
+        // Business selection changes only piece demand. Disk files remain enabled
+        // throughout playback so adding a download never exports a live partfile.
         reapply_locked();
     }
 
     void select_files(const std::vector<lt::download_priority_t>& priorities,
                       const std::set<int>& paused = {}) {
         std::lock_guard<std::mutex> lock(mu_);
-        file_priorities_ = priorities;
+        download_selection_ = priorities;
         paused_files_ = paused;
         rebuild_base_locked();
-        handle_.prioritize_files(file_priorities_);
         reapply_locked();
     }
 
     std::vector<lt::download_priority_t> download_priorities() {
         std::lock_guard<std::mutex> lock(mu_);
-        return file_priorities_;
+        return download_selection_;
     }
 
     // Keep disk/file selection intact: pause only withdraws the piece baseline.
     // Public callers serialize this with stream creation through lifecycle_mu.
     void set_download_paused(int index, bool paused) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (index < 0 || size_t(index) >= file_priorities_.size()
-            || file_priorities_[index] == lt::dont_download)
+        if (index < 0 || size_t(index) >= download_selection_.size()
+            || download_selection_[index] == lt::dont_download)
             throw std::invalid_argument("file is not selected for download");
         const bool changed = paused ? paused_files_.insert(index).second : paused_files_.erase(index) != 0;
         if (!changed) return;
@@ -918,16 +916,14 @@ public:
     void cancel_download(int index) {
         std::lock_guard<std::mutex> lock(mu_);
         const auto ti = handle_.torrent_file();
-        if (index < 0 || size_t(index) >= file_priorities_.size()
+        if (index < 0 || size_t(index) >= download_selection_.size()
             || ti->files().pad_file_at(lt::file_index_t(index)))
             throw std::invalid_argument("invalid download file index");
-        if (file_priorities_[index] == lt::dont_download) return;
-        file_priorities_[index] = lt::dont_download;
+        if (download_selection_[index] == lt::dont_download) return;
+        download_selection_[index] = lt::dont_download;
         paused_files_.erase(index);
         rebuild_base_locked();
-        // Async file_prio_alert must reapply the remaining playback/other-file
-        // demands after libtorrent updates storage and resets piece priorities.
-        handle_.prioritize_files(file_priorities_);
+        // Withdraw only background demand; keep playback and disk layout intact.
         reapply_locked();
     }
 
@@ -938,7 +934,7 @@ public:
 
     bool has_downloads() {
         std::lock_guard<std::mutex> lock(mu_);
-        return std::any_of(file_priorities_.begin(), file_priorities_.end(),
+        return std::any_of(download_selection_.begin(), download_selection_.end(),
             [](auto priority) { return priority != lt::dont_download; });
     }
 
@@ -1040,7 +1036,7 @@ public:
         for (const auto& owner : demands_)
             for (const auto& entry : owner.second) pieces.insert(entry.first);
         demands_.clear(); // late worker updates can no longer find an owner
-        file_priorities_.assign(file_priorities_.size(), lt::dont_download);
+        download_selection_.assign(download_selection_.size(), lt::dont_download);
         base_priorities_.assign(base_priorities_.size(), 0);
         for (int piece : pieces) apply_locked(piece);
     }
@@ -1063,8 +1059,8 @@ private:
         base_priorities_.assign(size_t(ti->num_pieces()), 0);
         for (int file = 0; file < files.num_files(); ++file) {
             const auto index = lt::file_index_t(file);
-            if (files.pad_file_at(index)) { file_priorities_[file] = lt::dont_download; continue; }
-            const int priority = static_cast<std::uint8_t>(file_priorities_[file]);
+            if (files.pad_file_at(index)) { download_selection_[file] = lt::dont_download; continue; }
+            const int priority = static_cast<std::uint8_t>(download_selection_[file]);
             const auto size = files.file_size(index);
             if (!priority || size <= 0 || paused_files_.count(file)) continue;
             const auto offset = files.file_offset(index);
@@ -1109,7 +1105,7 @@ private:
     std::mutex mu_;
     lt::torrent_handle handle_;
     bool initialized_ = false;
-    std::vector<lt::download_priority_t> file_priorities_;
+    std::vector<lt::download_priority_t> download_selection_;
     std::vector<int> base_priorities_;
     std::set<int> paused_files_;
     // Reader 0 owns startup/preload requests. Positive IDs own HTTP GETs.
@@ -1527,11 +1523,15 @@ struct SessionWrapper {
             try {
                 if (!params) throw std::runtime_error(error);
                 auto saved = *params;
-                saved.file_priorities = request.selection;
+                // Storage priorities are not business download selections.
+                saved.file_priorities.assign(request.selection.size(), lt::default_priority);
                 saved.piece_priorities.clear(); // never persist playback windows
                 saved.flags &= ~lt::torrent_flags::stop_when_ready;
                 auto entry = lt::write_resume_data(saved);
-                entry["ltf-version"] = 2;
+                entry["ltf-version"] = 3;
+                auto& selection = entry["ltf-download-selection"].list();
+                for (auto priority : request.selection)
+                    selection.emplace_back(static_cast<std::uint8_t>(priority));
                 auto& paused = entry["ltf-paused-files"].list();
                 for (int file : request.paused_files) paused.emplace_back(file);
                 entry["ltf-stream-only"] = request.stream_only ? 1 : 0;
@@ -1684,22 +1684,18 @@ struct SessionWrapper {
                             auto scheduler = schedulers.find(mid);
                             if (scheduler != schedulers.end()) {
                                 scheduler->second->reapply();
-                                is_stream_only = false;
+                            } else if (is_stream_only) {
+                                // Registration and metadata delivery are serialized by mu.
+                                // No payload was requested while upload_mode was set.
+                                auto ti = mra->handle.torrent_file();
+                                if (ti) {
+                                    std::vector<lt::download_priority_t> priorities(
+                                        size_t(ti->num_pieces()), lt::dont_download);
+                                    mra->handle.prioritize_pieces(priorities);
+                                }
                             }
-                            if (is_stream_only) {
-                                try {
-                                    auto ti = mra->handle.torrent_file();
-                                    if (ti) {
-                                        auto status = mra->handle.status(lt::torrent_handle::query_pieces);
-                                        std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> priorities;
-                                        for (int p = 0; p < ti->num_pieces(); ++p) {
-                                            if (p < status.pieces.size() && status.pieces[lt::piece_index_t(p)]) continue;
-                                            priorities.emplace_back(lt::piece_index_t(p), lt::dont_download);
-                                        }
-                                        mra->handle.prioritize_pieces(priorities);
-                                    }
-                                } catch (...) {}
-                            }
+                            if (is_stream_only)
+                                mra->handle.unset_flags(lt::torrent_flags::upload_mode);
                         }
 
                         // queue alert for dart
@@ -2725,9 +2721,12 @@ TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
             for (auto* t : kDefaultTrackers) atp.trackers.emplace_back(t);
         }
 
-        // Keep peers connected; the metadata handler clears missing-piece priorities.
+        // Fetch metadata without payload requests. Once metadata arrives, install
+        // zero piece demand before lifting this gate; keep real disk files enabled.
         if (stream_only) {
-            atp.flags |= lt::torrent_flags::default_dont_download;
+            atp.flags |= lt::torrent_flags::upload_mode;
+            atp.flags &= ~lt::torrent_flags::default_dont_download;
+            atp.file_priorities.clear(); // magnet so= must not put payload into partfile
             atp.storage_mode = lt::storage_mode_sparse;
         }
 
@@ -2755,9 +2754,9 @@ TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
 
         // Metadata is available, so nothing is wanted until a stream starts.
         if (stream_only) {
-            atp.flags |= lt::torrent_flags::default_dont_download;
             atp.storage_mode = lt::storage_mode_sparse;
-            atp.file_priorities.assign((size_t)ti->num_files(), lt::dont_download);
+            atp.file_priorities.assign((size_t)ti->num_files(), lt::default_priority);
+            atp.piece_priorities.assign((size_t)ti->num_pieces(), lt::dont_download);
         }
 
         std::lock_guard<std::mutex> registration_lock(sw->mu);
@@ -2852,18 +2851,28 @@ static lt::add_torrent_params decode_download_resume(const char* data, int size,
     lt::error_code ec;
     auto node = lt::bdecode(lt::span<char const>(data, size), ec);
     if (ec || node.type() != lt::bdecode_node::dict_t
-        || (node.dict_find_int_value("ltf-version") != 1 && node.dict_find_int_value("ltf-version") != 2))
+        || node.dict_find_int_value("ltf-version") != 3)
         throw std::invalid_argument("invalid or unsupported download resume data");
     auto params = lt::read_resume_data(node, ec);
     if (ec) throw std::runtime_error(ec.message());
     if (params.save_path.empty()) throw std::invalid_argument("resume save path is empty");
     stream_only = node.dict_find_int_value("ltf-stream-only") != 0;
-    params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::stop_when_ready);
+    params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::stop_when_ready
+        | lt::torrent_flags::default_dont_download | lt::torrent_flags::upload_mode);
     params.piece_priorities.clear();
-    if (params.ti && !params.file_priorities.empty()
-        && params.file_priorities.size() != size_t(params.ti->num_files()))
-        throw std::invalid_argument("resume file selection does not match metadata");
-    if (node.dict_find_int_value("ltf-version") == 2) {
+    const auto selection = node.dict_find_list("ltf-download-selection");
+    if (!params.ti || !selection || selection.list_size() != params.ti->num_files())
+        throw std::invalid_argument("invalid download selection");
+    // Return business priorities to the restore caller, which installs them in
+    // the scheduler and replaces these with storage priorities before adding.
+    params.file_priorities.clear();
+    for (int i = 0; i < selection.list_size(); ++i) {
+        const auto value = selection.list_at(i);
+        if (value.type() != lt::bdecode_node::int_t || value.int_value() < 0 || value.int_value() > 7)
+            throw std::invalid_argument("invalid download priority");
+        params.file_priorities.emplace_back(static_cast<std::uint8_t>(value.int_value()));
+    }
+    {
         const auto paused = node.dict_find_list("ltf-paused-files");
         if (!paused) throw std::invalid_argument("missing paused file selection");
         for (int i = 0; i < paused.list_size(); ++i) {
@@ -2904,6 +2913,8 @@ TORRENT_API lt_torrent_id lt_restore_resume_data(lt_session_t session, const cha
         auto params = decode_download_resume(data, size, stream_only, paused_files);
         lt::error_code ec;
         const auto selection = params.file_priorities;
+        params.file_priorities.assign(size_t(params.ti->num_files()), lt::default_priority);
+        params.piece_priorities.assign(size_t(params.ti->num_pieces()), lt::dont_download);
         std::lock_guard<std::mutex> streams_lock(sw->streams_mu);
         std::lock_guard<std::mutex> lock(sw->mu);
         // Restore is idempotent and must never overwrite a live task's selection.

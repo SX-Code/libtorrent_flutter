@@ -548,7 +548,7 @@ static uintmax_t disk_bytes(const std::filesystem::path& path) {
     return bytes;
 }
 
-// Real disk writes (including libtorrent's partfile), ten episode switches,
+// Real disk writes, ten episode switches,
 // and real upload from the currently playing episode. No public swarm needed.
 static void test_current_episode(lt_session_t session, const std::filesystem::path& folder) {
     namespace fs = std::filesystem;
@@ -754,12 +754,23 @@ static void test_file_downloads(lt_session_t session, const std::filesystem::pat
     const auto handle = sw->handles.at(id);
     const auto scheduler = sw->schedulers.at(id);
     require(scheduler->demand(40).priority == 0, "test gap was prefetched");
+    // Playback must write directly into the final file before caching starts.
+    // A later selection must leave that storage policy unchanged.
+    const auto storage_priorities = handle.get_file_priorities();
+    require(storage_priorities.size() == 2
+        && storage_priorities[0] == lt::default_priority
+        && storage_priorities[1] == lt::default_priority, "playback still uses partfile storage");
+    handle.add_piece(lt::piece_index_t(0), data.data());
+    wait_until([&] { return handle.have_piece(lt::piece_index_t(0)); }, "playback piece did not verify");
+    require(fs::exists(folder / "downloads/first.mp4"), "playback did not create real video file");
     require(lt_download_file(session, id, -1) == 0 && lt_download_file(session, id, 2) == 0,
             "invalid download file accepted");
     require(lt_download_file(session, -1, 0) == 0, "unknown task accepted download");
     require(lt_download_file(session, id, 0) == 1 && lt_download_file(session, id, 0) == 1,
             "download registration is not idempotent");
     require(sw->handles.at(id) == handle && sw->streams.count(first), "download interrupted playback");
+    require(handle.get_file_priorities() == storage_priorities && !handle.status().errc,
+        "adding cache changed storage or raised a torrent error");
     require(lt_has_downloads(session, id) == 1 && scheduler->demand(40).priority == 4,
             "download omitted skipped middle pieces");
     require(scheduler->add_reader(first, 42), "seek reader registration failed");
@@ -783,7 +794,7 @@ static void test_file_downloads(lt_session_t session, const std::filesystem::pat
             "file-priority completion lost download baseline");
     lt_file_download_status status[2]{};
     require(lt_get_file_downloads(session, id, status, 2) == 1 && !status[0].is_complete
-            && status[0].verified_bytes == 0, "empty file was reported complete");
+            && status[0].verified_bytes == piece_length, "playback data was lost when adding cache");
     for (int piece = 0; piece <= boundary; ++piece) {
         if (piece == 40) continue; // leave a seek gap despite complete head and tail
         handle.add_piece(lt::piece_index_t(piece), data.data());
@@ -815,8 +826,8 @@ static void test_file_downloads(lt_session_t session, const std::filesystem::pat
         && lt_get_file_downloads(session, id, status, 2) == 1
         && status[0].file_index == 1 && status[0].is_paused,
         "cancel changed sibling pause or removed playback");
-    wait_until([&] { return handle.get_file_priorities()[0] == lt::dont_download; },
-        "cancel did not update file priorities");
+    require(handle.get_file_priorities() == storage_priorities,
+        "cancel changed disk storage priorities");
     scheduler->reapply();
     require(scheduler->demand(0).priority == 7 && scheduler->demand(40).priority == 0,
         "cancel erased playback or retained background baseline");
@@ -939,7 +950,7 @@ static void test_file_pause(lt_session_t session, const std::filesystem::path& f
         require(lt_validate_resume_data(session, bytes.data(), size) == 1, "paused snapshot invalid");
         lt::error_code ec;
         const auto node = lt::bdecode(lt::span<char const>(bytes.data(), bytes.size()), ec);
-        require(!ec && node.dict_find_int_value("ltf-version") == 2
+        require(!ec && node.dict_find_int_value("ltf-version") == 3
             && node.dict_find_list("ltf-paused-files").list_int_value_at(0) == 0,
             "paused resume metadata missing");
         lt_remove_torrent(session, id, 0);
@@ -958,18 +969,19 @@ static void test_file_pause(lt_session_t session, const std::filesystem::path& f
             && restored_scheduler->paused_downloads().empty(), "restore overwrote live state");
         lt_remove_torrent(session, restored, 0);
 
-        // Legacy v1 means enabled selections; malformed v2 must not create tasks.
+        // Old snapshots may reference partfiles; never silently restore them
+        // under the new real-file storage policy.
         auto legacy = lt::write_resume_data(lt::read_resume_data(node, ec));
-        legacy["ltf-version"] = 1;
-        legacy["ltf-stream-only"] = 1;
-        std::vector<char> old_bytes;
-        lt::bencode(std::back_inserter(old_bytes), legacy);
-        const auto old_id = lt_restore_resume_data(session, old_bytes.data(), int(old_bytes.size()));
-        require(old_id > 0 && lt_get_file_downloads(session, old_id, status, 2) == file_count
-            && !status[0].is_paused && sw->schedulers.at(old_id)->demand(0).priority == 4,
-            "legacy resume was not enabled");
-        lt_remove_torrent(session, old_id, 0);
-        legacy["ltf-version"] = 2;
+        for (int version : {1, 2}) {
+            legacy["ltf-version"] = version;
+            std::vector<char> old_bytes;
+            lt::bencode(std::back_inserter(old_bytes), legacy);
+            require(lt_restore_resume_data(session, old_bytes.data(), int(old_bytes.size())) == -1,
+                "partfile-era snapshot accepted");
+        }
+        legacy["ltf-version"] = 3;
+        auto& selection = legacy["ltf-download-selection"].list();
+        for (int file = 0; file < file_count; ++file) selection.emplace_back(4);
         for (int invalid : {-1, file_count}) {
             legacy["ltf-paused-files"].list() = {lt::entry(invalid)};
             std::vector<char> invalid_bytes;
@@ -1021,8 +1033,11 @@ static void test_resume_state(lt_session_t session, const std::filesystem::path&
     auto params = lt::read_resume_data(node, ec);
     require(!ec && params.ti && params.file_priorities.size() == 2,
         "resume metadata/selection missing");
-    require(params.file_priorities[0] == lt::default_priority && params.file_priorities[1] == lt::dont_download,
-        "playback demand leaked into resume file selection");
+    require(params.file_priorities[0] == lt::default_priority && params.file_priorities[1] == lt::default_priority,
+        "resume disabled real-file storage");
+    require(node.dict_find_list("ltf-download-selection").list_int_value_at(0) == 4
+        && node.dict_find_list("ltf-download-selection").list_int_value_at(1) == 0,
+        "playback demand leaked into business selection");
     require(params.piece_priorities.empty(), "playback piece priorities persisted");
     require(bool(params.flags & lt::torrent_flags::paused), "resume lost paused state");
     const std::string magnet = lt_get_torrent_magnet(session, id);
@@ -1042,8 +1057,9 @@ static void test_resume_state(lt_session_t session, const std::filesystem::path&
         "restored paused task was resumed");
     require(lt_restore_resume_data(session, "le", 2) == -1, "non-dictionary resume accepted");
     auto malformed = lt::write_resume_data(params);
-    malformed["ltf-version"] = 1;
-    malformed["file_priority"].list().pop_back();
+    malformed["ltf-version"] = 3;
+    malformed["ltf-download-selection"].list() = {lt::entry(4)};
+    malformed["ltf-paused-files"].list();
     std::vector<char> malformed_bytes;
     lt::bencode(std::back_inserter(malformed_bytes), malformed);
     require(lt_restore_resume_data(session, malformed_bytes.data(), int(malformed_bytes.size())) == -1,
