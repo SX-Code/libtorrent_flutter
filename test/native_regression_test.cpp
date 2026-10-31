@@ -6,6 +6,7 @@
 #include <libtorrent/hasher.hpp>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 
 static void require(bool condition, const char* message) {
@@ -801,9 +802,187 @@ static void test_file_downloads(lt_session_t session, const std::filesystem::pat
     require(lt_download_file(session, id, 1) == 1, "cannot add second download");
     require(lt_get_file_downloads(session, id, status, 2) == 2 && !status[1].is_complete
             && status[1].verified_bytes == piece_length - 17, "shared boundary progress is wrong");
+    require(lt_cancel_file_download(session, id, -1) == 0
+        && lt_cancel_file_download(session, id, 2) == 0
+        && lt_cancel_file_download(session, -1, 0) == 0, "invalid cancellation accepted");
+    require(lt_pause_file_download(session, id, 1) == 1, "sibling pause failed");
+    const auto playing = lt_start_stream(session, id, 0, 512 * 1024);
+    require(playing > 0, "cancel playback fixture failed");
+    const int port = sw->streams.at(playing)->server_port;
+    require(lt_cancel_file_download(session, id, 0) == 1
+        && lt_cancel_file_download(session, id, 0) == 1, "cancel is not idempotent");
+    require(sw->streams.count(playing) && sw->handles.at(id) == handle
+        && lt_get_file_downloads(session, id, status, 2) == 1
+        && status[0].file_index == 1 && status[0].is_paused,
+        "cancel changed sibling pause or removed playback");
+    wait_until([&] { return handle.get_file_priorities()[0] == lt::dont_download; },
+        "cancel did not update file priorities");
+    scheduler->reapply();
+    require(scheduler->demand(0).priority == 7 && scheduler->demand(40).priority == 0,
+        "cancel erased playback or retained background baseline");
+    auto reply = http_request(port, "GET", "0-499");
+    require(reply.find("HTTP/1.1 206") == 0
+        && reply.substr(reply.find("\r\n\r\n") + 4) == std::string(500, 'd'),
+        "cancel broke playback of existing data");
+    require(lt_resume_file_download(session, id, 0) == 0, "resume resurrected cancelled selection");
+    require(lt_resume_file_download(session, id, 1) == 1, "sibling resume failed");
+    lt_stop_stream(session, playing);
+    require(scheduler->demand(0).priority == 0 && scheduler->demand(boundary).priority == 4
+        && scheduler->demand(boundary + 1).priority == 4, "cancel erased sibling/shared demands");
+    require(lt_pause_file_download(session, id, 1) == 1
+        && lt_cancel_file_download(session, id, 1) == 1
+        && lt_has_downloads(session, id) == 0 && scheduler->paused_downloads().empty(),
+        "last cancellation retained selection/pause");
+    require(fs::exists(folder / "downloads/first.mp4"), "cancel immediately deleted payload");
+    require(lt_download_file(session, id, 1) == 1
+        && lt_get_file_downloads(session, id, status, 2) == 1 && !status[0].is_paused,
+        "re-added download inherited cancelled pause");
     lt_remove_torrent(session, id, 0);
     require(fs::exists(folder / "downloads/first.mp4") && lt_has_downloads(session, id) == 0,
             "remove without delete lost files or retained demands");
+}
+
+// File pause keeps selection/storage ownership but removes only its own piece
+// baseline. Playback occupancy and pause are serialized by lifecycle_mu.
+static void test_file_pause(lt_session_t session, const std::filesystem::path& folder) {
+    namespace fs = std::filesystem;
+    fs::create_directories(folder);
+    constexpr int piece_length = 256 * 1024;
+    const std::string content(piece_length, 'p');
+    auto* sw = to_sw(session);
+    for (int file_count : {1, 2}) {
+        const auto name = "pause" + std::to_string(file_count);
+        lt::file_storage files;
+        for (int i = 0; i < file_count; ++i)
+            files.add_file(name + "/" + std::to_string(i) + ".mp4", piece_length * 3 / 2);
+        lt::create_torrent torrent(files, piece_length, lt::create_torrent::v1_only);
+        for (int i = 0; i < torrent.num_pieces(); ++i) {
+            const int bytes = int(std::min<int64_t>(piece_length,
+                files.total_size() - int64_t(i) * piece_length));
+            torrent.set_hash(lt::piece_index_t(i), lt::hasher(content.data(), bytes).final());
+        }
+        std::vector<char> encoded;
+        lt::bencode(std::back_inserter(encoded), torrent.generate());
+        const auto path = folder / (name + ".torrent");
+        std::ofstream(path, std::ios::binary).write(encoded.data(), encoded.size());
+        const auto id = lt_add_torrent_file(session, path.string().c_str(), folder.string().c_str(), 1);
+        require(id > 0, "pause fixture failed");
+        require(lt_pause_file_download(session, id, 0) == 0
+            && lt_resume_file_download(session, id, 0) == 0, "unselected pause/resume accepted");
+        require(lt_pause_file_download(session, -1, 0) == 0
+            && lt_resume_file_download(session, id, -1) == 0, "invalid pause/resume accepted");
+        for (int i = 0; i < file_count; ++i) require(lt_download_file(session, id, i) == 1, "selection failed");
+        const auto scheduler = sw->schedulers.at(id);
+        const auto handle = sw->handles.at(id);
+        require(lt_pause_file_download(session, id, file_count) == 0, "out-of-range pause accepted");
+        require(lt_pause_file_download(session, id, 0) == 1
+            && lt_pause_file_download(session, id, 0) == 1, "pause is not idempotent");
+        require(lt_download_file(session, id, 0) == 1, "repeat selection failed");
+        lt_file_download_status status[2]{};
+        require(lt_get_file_downloads(session, id, status, 2) == file_count
+            && status[0].is_paused && status[0].priority == 4 && lt_has_downloads(session, id) == 1,
+            "pause lost selection/retention or repeated download resumed it");
+        scheduler->reapply(); // simulate asynchronous file_prio_alert
+        require(scheduler->demand(0).priority == 0, "paused file retained baseline");
+        require(scheduler->demand(1).priority == (file_count == 1 ? 0 : 4), "shared boundary lost sibling demand");
+        wait_until([&] { return handle.piece_priority(lt::piece_index_t(0)) == lt::dont_download; },
+            "native picker did not apply pause");
+        if (file_count == 2) {
+            require(scheduler->demand(2).priority == 4 && !status[1].is_paused, "pause affected sibling");
+            const auto sibling = lt_start_stream(session, id, 1, 512 * 1024);
+            require(sibling > 0 && lt_pause_file_download(session, id, 0) == 1,
+                "sibling playback blocked unrelated pause");
+            lt_stop_stream(session, sibling);
+        }
+        require(lt_resume_file_download(session, id, 0) == 1
+            && lt_resume_file_download(session, id, 0) == 1 && scheduler->demand(0).priority == 4,
+            "resume did not restore baseline");
+        const auto first = lt_start_stream(session, id, 0, 512 * 1024);
+        const auto overlap = lt_start_stream(session, id, 0, 512 * 1024);
+        require(first > 0 && overlap > 0, "pause playback fixture failed");
+        require(lt_pause_file_download(session, id, 0) == -1
+            && std::string(lt_last_error()) == "file_in_use", "playing file accepted pause");
+        require(scheduler->paused_downloads().empty(), "rejected pause mutated selection");
+        lt_stop_stream(session, first);
+        require(lt_pause_file_download(session, id, 0) == -1, "remaining stream did not protect file");
+        lt_stop_stream(session, overlap);
+        require(lt_pause_file_download(session, id, 0) == 1, "stopped file cannot pause");
+
+        // Playback started after pause uses its own demands, leaving pause intact.
+        const auto paused_stream = lt_start_stream(session, id, 0, 512 * 1024);
+        require(paused_stream > 0 && scheduler->demand(0).priority == 7
+            && scheduler->paused_downloads().count(0), "playback lost paused file demand");
+        require(lt_pause_file_download(session, id, 0) == -1, "already paused playback bypassed guard");
+        lt_stop_stream(session, paused_stream);
+        require(scheduler->demand(0).priority == 0, "stop resumed paused download");
+
+        // Either pause wins before start, or the live stream rejects pause.
+        require(lt_resume_file_download(session, id, 0) == 1, "race setup failed");
+        auto start = std::async(std::launch::async, [&] { return lt_start_stream(session, id, 0, 512 * 1024); });
+        const int paused = lt_pause_file_download(session, id, 0);
+        const auto racing_stream = start.get();
+        require(racing_stream > 0 && (paused == 1 || paused == -1), "pause/start race failed");
+        require(bool(scheduler->paused_downloads().count(0)) == (paused == 1)
+            && scheduler->demand(0).priority == 7, "pause/start race corrupted demands");
+        lt_stop_stream(session, racing_stream);
+        require(lt_pause_file_download(session, id, 0) == 1, "pause after race failed");
+
+        require(lt_request_resume_data(session, id) == 1, "paused snapshot request failed");
+        int size = 0;
+        wait_until([&] {
+            size = lt_read_resume_data(session, id, nullptr, 0);
+            require(size >= 0, lt_last_error());
+            return size > 0;
+        }, "paused snapshot missing");
+        std::vector<char> bytes(size);
+        require(lt_read_resume_data(session, id, bytes.data(), size) == size, "paused snapshot copy failed");
+        require(lt_validate_resume_data(session, bytes.data(), size) == 1, "paused snapshot invalid");
+        lt::error_code ec;
+        const auto node = lt::bdecode(lt::span<char const>(bytes.data(), bytes.size()), ec);
+        require(!ec && node.dict_find_int_value("ltf-version") == 2
+            && node.dict_find_list("ltf-paused-files").list_int_value_at(0) == 0,
+            "paused resume metadata missing");
+        lt_remove_torrent(session, id, 0);
+        const auto restored = lt_restore_resume_data(session, bytes.data(), size);
+        require(restored > 0 && lt_get_file_downloads(session, restored, status, 2) == file_count
+            && status[0].is_paused && lt_has_downloads(session, restored) == 1,
+            "restore dropped paused selection");
+        const auto restored_scheduler = sw->schedulers.at(restored);
+        require(restored_scheduler->demand(0).priority == 0
+            && restored_scheduler->demand(1).priority == (file_count == 1 ? 0 : 4),
+            "restore enabled paused baseline");
+        require(lt_resume_file_download(session, restored, 0) == 1
+            && restored_scheduler->demand(0).priority == 4, "restored file cannot resume");
+        // Restoring into a live task must not overwrite newer pause state.
+        require(lt_restore_resume_data(session, bytes.data(), size) == restored
+            && restored_scheduler->paused_downloads().empty(), "restore overwrote live state");
+        lt_remove_torrent(session, restored, 0);
+
+        // Legacy v1 means enabled selections; malformed v2 must not create tasks.
+        auto legacy = lt::write_resume_data(lt::read_resume_data(node, ec));
+        legacy["ltf-version"] = 1;
+        legacy["ltf-stream-only"] = 1;
+        std::vector<char> old_bytes;
+        lt::bencode(std::back_inserter(old_bytes), legacy);
+        const auto old_id = lt_restore_resume_data(session, old_bytes.data(), int(old_bytes.size()));
+        require(old_id > 0 && lt_get_file_downloads(session, old_id, status, 2) == file_count
+            && !status[0].is_paused && sw->schedulers.at(old_id)->demand(0).priority == 4,
+            "legacy resume was not enabled");
+        lt_remove_torrent(session, old_id, 0);
+        legacy["ltf-version"] = 2;
+        for (int invalid : {-1, file_count}) {
+            legacy["ltf-paused-files"].list() = {lt::entry(invalid)};
+            std::vector<char> invalid_bytes;
+            lt::bencode(std::back_inserter(invalid_bytes), legacy);
+            require(lt_validate_resume_data(session, invalid_bytes.data(), int(invalid_bytes.size())) == -1,
+                "invalid paused index accepted");
+        }
+        legacy["ltf-paused-files"].list() = {lt::entry(0), lt::entry(0)};
+        std::vector<char> duplicate;
+        lt::bencode(std::back_inserter(duplicate), legacy);
+        require(lt_restore_resume_data(session, duplicate.data(), int(duplicate.size())) == -1,
+            "duplicate pause selection accepted");
+    }
 }
 
 static void test_resume_state(lt_session_t session, const std::filesystem::path& folder) {
@@ -984,6 +1163,7 @@ static void test_local_stream() {
         test_switch_connection_retention(session, torrent_path, folder);
         test_switch_missing_demands(session, torrent_path, folder);
         test_file_downloads(session, folder / "file-downloads");
+        test_file_pause(session, folder / "file-pause");
         test_resume_state(session, folder / "resume-state");
         test_stream_lifecycle(session, torrent_path, folder / "empty");
         auto cleanup_id = lt_add_torrent_file(session, torrent_path.string().c_str(), folder.string().c_str(), 0);

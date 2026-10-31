@@ -261,6 +261,36 @@ C++ 按文件记录完整下载需求，独立于播放流。缓存文件的所�
 
 **清理兼容性变更：** `stopStream`、`stopAllStreamsForTorrent` 不再删除任务和文件。`keepTorrent` 仅保留参数兼容，即使传 `false` 也会被忽略。原先依赖停流自动清理的调用方，需要改为显式调用 `removeTorrent`。`dispose()` 保留下载任务文件、删除临时任务；`disposeTorrent`、`disposeAll` 仍是显式删除入口，也会删除用户选择的缓存文件。播放器需单独释放；libtorrent 文件删除是异步操作。
 
+### 按文件暂停与恢复缓存
+
+```dart
+try {
+  engine.pauseFileDownload(torrentId, fileIndex: episodeIndex);
+} on FileDownloadInUseException {
+  // 提示：该集正在播放，无法暂停。
+}
+final paused = engine.getFileDownloads(torrentId)
+    .firstWhere((file) => file.fileIndex == episodeIndex).isPaused;
+engine.resumeFileDownload(torrentId, fileIndex: episodeIndex);
+```
+
+暂停保留文件选择、校验进度和已有数据，`hasDownloads` 仍为 true，只撤销目标文件的后台分片需求，不影响合集其他文件。Native 在生命周期锁内检查目标文件的播放流，仍有流时拒绝暂停；缓冲中或播放器暂停但未 `stopStream` 也属于占用，全部对应流停止后才能暂停。整组暂停由应用逐文件调用，并报告播放占用项，不能把部分成功显示成全部暂停。
+
+两个接口均要求文件已经选中缓存，支持重复调用；再次 `downloadFile` 不会恢复已暂停文件。`resumeFileDownload` 也会恢复整个 torrent 的暂停状态。`setFilePriorities` 替换选择时会清除文件暂停状态。先暂停缓存再启动播放仍可播放，后台暂停保持不变；共享分片和在途请求仍可能使暂停文件的进度增加。完成判断使用 `FileDownloadInfo.isComplete`，不能根据 torrent 整体完成状态判断暂停文件已完成。
+
+配置断点持久化后，文件暂停状态可保存并在重启后恢复。新版 resume 格式为 v2，兼容读取 v1（原有选择默认启用），旧原生库不能读取 v2。需同步重编译原生库以匹配新增导出和状态字段。
+
+### 取消文件缓存
+
+```dart
+engine.cancelFileDownload(torrentId, fileIndex: episodeIndex);
+await engine.saveDownloadState(stateDirectory); // 等待取消状态持久化
+```
+
+取消会撤销指定文件的缓存选择并清除暂停状态，`getFileDownloads` 不再返回该文件，不影响当前播放、其他文件选择和共享分片。与暂停不同，目标文件正在播放时也允许取消后台缓存。需要元数据；重复取消有效但未选中的文件是幂等操作，无效文件索引或任务抛出 `StateError`。取消不会恢复整个 torrent 的暂停。再次缓存使用 `downloadFile`，不能通过 `resumeFileDownload` 恢复已取消选择。
+
+取消调用本身不删除已有数据。如果取消的是最后一个选择，`hasDownloads` 变为 false，下次保存会从下载清单移除该任务，正常 `dispose()` 时可能按临时任务清理数据；普通 `streamOnly=false` 任务取消全部文件后也遵循这一规则。需要立即删除时，由应用确认无播放与其他引用后显式调用 `removeTorrent(deleteFiles: true)`。自动保存是异步的，要求退出前确认取消已落盘时应等待 `saveDownloadState`。使用新增 API 前需重编译包含 `lt_cancel_file_download` 的原生库。
+
 ### 下载任务持久化与重启恢复
 
 **下载文件和任务记录都应使用应用持久目录**，不要使用系统临时目录：

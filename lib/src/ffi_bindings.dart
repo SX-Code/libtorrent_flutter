@@ -75,6 +75,8 @@ final class LtFileDownloadStatus extends Struct {
   external int priority;
   @Int32()
   external int isComplete;
+  @Int32()
+  external int isPaused;
 }
 
 // ─── lt_stream_status ─────────────────────────────────────────────────────────
@@ -388,6 +390,9 @@ class TorrentBridgeBindings {
   late final LtGetFiles getFiles;
   late final LtSetFilePriorities setFilePriorities;
   late final LtDownloadFile downloadFile;
+  late final LtDownloadFile pauseFileDownload;
+  late final LtDownloadFile resumeFileDownload;
+  late final LtDownloadFile cancelFileDownload;
   late final LtHasDownloads hasDownloads;
   late final LtGetFileDownloads getFileDownloads;
   late final LtStartStream startStream;
@@ -470,6 +475,12 @@ class TorrentBridgeBindings {
         .asFunction<LtSetFilePriorities>();
     downloadFile =
         _lib.lookupFunction<_DownloadFileN, LtDownloadFile>('lt_download_file');
+    pauseFileDownload = _lib.lookupFunction<_DownloadFileN, LtDownloadFile>(
+        'lt_pause_file_download');
+    resumeFileDownload = _lib.lookupFunction<_DownloadFileN, LtDownloadFile>(
+        'lt_resume_file_download');
+    cancelFileDownload = _lib.lookupFunction<_DownloadFileN, LtDownloadFile>(
+        'lt_cancel_file_download');
     hasDownloads =
         _lib.lookupFunction<_HasDownloadsN, LtHasDownloads>('lt_has_downloads');
     getFileDownloads =

@@ -54,6 +54,7 @@ Future<void> checkDownloadState() async {
     final stream = engine.startStream(id, fileIndex: 1); // unselected file
     await _until(() => engine.getFileDownloads(id).single.isComplete,
         'local download not verified');
+    engine.pauseFileDownload(id, fileIndex: 0);
     await engine.saveDownloadState(state);
     final saved = jsonDecode(await manifest.readAsString()) as Map;
     final magnet = (saved['downloads'] as Map).keys.single as String;
@@ -96,6 +97,13 @@ Future<void> checkDownloadState() async {
         engine.getFileDownloads(restored).length == 1 &&
             engine.getFileDownloads(restored).single.fileIndex == 0,
         'playback-only file became a download');
+    _check(
+        engine.getFileDownloads(restored).single.isPaused &&
+            engine.hasDownloads(restored),
+        'restart lost file pause or retention');
+    engine.resumeFileDownload(restored, fileIndex: 0);
+    _check(!engine.getFileDownloads(restored).single.isPaused,
+        'restored download cannot resume');
     await _until(() => engine.getFileDownloads(restored).single.isComplete,
         'restored verified data lost');
     final repeated = await engine.restoreDownloadState(state);
@@ -104,12 +112,16 @@ Future<void> checkDownloadState() async {
 
     // Selection updates and completed downloads survive automatic checkpoints.
     engine.downloadFile(restored, fileIndex: 1);
+    engine.pauseFileDownload(restored, fileIndex: 1);
     await _until(() {
       final entries =
           jsonDecode(manifest.readAsStringSync())['downloads'] as Map;
-      return entries.values.any((blob) => ascii
-          .decode(base64Decode(blob as String), allowInvalid: true)
-          .contains('file_priorityli4ei4ee'));
+      return entries.values.any((blob) {
+        final content =
+            ascii.decode(base64Decode(blob as String), allowInvalid: true);
+        return content.contains('file_priorityli4ei4ee') &&
+            content.contains('ltf-paused-filesli1ee');
+      });
     }, 'automatic selection checkpoint did not update');
     await engine.dispose();
     await payload.delete();
@@ -117,6 +129,10 @@ Future<void> checkDownloadState() async {
     final missingId = engine.findTorrentByMagnet(magnet)!;
     _check(engine.getFileDownloads(missingId).length == 2,
         'updated download selection not restored');
+    _check(
+        engine.getFileDownloads(missingId).last.isPaused &&
+            !engine.getFileDownloads(missingId).last.isComplete,
+        'unfinished paused download was enabled after restart');
     await _until(() => !engine.getFileDownloads(missingId).first.isComplete,
         'missing payload falsely stayed complete');
 

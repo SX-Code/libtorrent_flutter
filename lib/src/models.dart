@@ -149,14 +149,33 @@ class TorrentInfo {
       'progress=${(progress * 100).toStringAsFixed(1)}%)';
 }
 
+/// A file cannot be paused while a playback stream still owns it.
+/// Stop all streams for this file before retrying the pause.
+class FileDownloadInUseException implements Exception {
+  final int torrentId;
+  final int fileIndex;
+
+  const FileDownloadInUseException(this.torrentId, this.fileIndex);
+
+  @override
+  String toString() =>
+      'FileDownloadInUseException: file $fileIndex in torrent $torrentId has an active playback stream';
+}
+
 /// A file selected for full download in the current engine session.
 /// Completion counts verified pieces, including shared boundary pieces.
 class FileDownloadInfo {
   final int fileIndex;
   final int fileSize;
   final int verifiedBytes;
+
+  /// Retained file selection priority, independent of [isPaused].
   final int priority;
   final bool isComplete;
+
+  /// Background download is paused; selection and verified data are retained.
+  /// Shared pieces or playback started after pausing can still increase progress.
+  final bool isPaused;
 
   const FileDownloadInfo({
     required this.fileIndex,
@@ -164,6 +183,7 @@ class FileDownloadInfo {
     required this.verifiedBytes,
     required this.priority,
     required this.isComplete,
+    this.isPaused = false,
   });
 
   double get progress => fileSize == 0 ? 1.0 : verifiedBytes / fileSize;

@@ -456,7 +456,52 @@ class LibtorrentFlutter {
     _persistence.changed();
   }
 
-  /// Whether this task owns any full-file downloads, including completed ones.
+  /// Pause a selected file's background download, retaining data and selection.
+  /// Throws [FileDownloadInUseException] if any stream still owns this file,
+  /// including buffering or a paused player whose stream has not been stopped.
+  /// Other files keep downloading. Repeated pauses are idempotent when unused.
+  /// Native validation serializes the check with stream start/switch/stop.
+  void pauseFileDownload(int torrentId, {required int fileIndex}) {
+    _checkAlive();
+    final result = _b.pauseFileDownload(_session, torrentId, fileIndex);
+    if (result == -1) {
+      throw FileDownloadInUseException(torrentId, fileIndex);
+    }
+    if (result != 1) {
+      throw StateError(
+          'pauseFileDownload failed: ${_b.lastError().toDartString()}');
+    }
+    _persistence.changed();
+  }
+
+  /// Resume an existing file download without changing other file selections.
+  /// Throws for an unselected file. Also resumes a torrent paused as a whole.
+  /// Calling [downloadFile] on a paused selection does not resume it.
+  void resumeFileDownload(int torrentId, {required int fileIndex}) {
+    _checkAlive();
+    if (_b.resumeFileDownload(_session, torrentId, fileIndex) != 1) {
+      throw StateError(
+          'resumeFileDownload failed: ${_b.lastError().toDartString()}');
+    }
+    _persistence.changed();
+  }
+
+  /// Cancel this file's cache selection without stopping playback or deleting data.
+  /// Requires metadata; repeated cancellation of a valid file is harmless.
+  /// The file disappears from [getFileDownloads]. Use [downloadFile] to add it again.
+  /// After the last selection is cancelled, dispose may clean up this task's data.
+  /// With persistence configured, changes are checkpointed automatically; await
+  /// [saveDownloadState] to confirm durable cancellation before terminating.
+  void cancelFileDownload(int torrentId, {required int fileIndex}) {
+    _checkAlive();
+    if (_b.cancelFileDownload(_session, torrentId, fileIndex) != 1) {
+      throw StateError(
+          'cancelFileDownload failed: ${_b.lastError().toDartString()}');
+    }
+    _persistence.changed();
+  }
+
+  /// Whether this task owns any full-file downloads, including paused/completed ones.
   /// Ordinary download magnets count before metadata arrives. Missing IDs do not.
   bool hasDownloads(int torrentId) {
     _checkAlive();
@@ -488,6 +533,7 @@ class LibtorrentFlutter {
                 verifiedBytes: buf[i].verifiedBytes,
                 priority: buf[i].priority,
                 isComplete: buf[i].isComplete != 0,
+                isPaused: buf[i].isPaused != 0,
               ));
     } finally {
       calloc.free(buf);
@@ -495,7 +541,8 @@ class LibtorrentFlutter {
   }
 
   /// Set download priorities per file (0 = skip, 1-7 = priority levels).
-  /// Replaces persistent download selection. Stop associated streams first.
+  /// Replaces persistent download selection and clears file-level pauses.
+  /// Stop associated streams first.
   /// Zero deselects a file without deleting bytes; downloadFile adds selection during playback.
   void setFilePriorities(int torrentId, List<int> priorities) {
     _checkAlive();

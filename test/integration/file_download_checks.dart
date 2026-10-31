@@ -5,6 +5,8 @@ import 'dart:io';
 
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 
+import 'file_cancel_checks.dart';
+
 void _check(bool condition, String message) {
   if (!condition) throw StateError(message);
 }
@@ -55,7 +57,31 @@ Future<void> checkFileDownloads() async {
             !selection.single.isComplete &&
             selection.single.verifiedBytes == 0,
         'download selection/status is wrong');
+    var inUse = false;
+    try {
+      engine.pauseFileDownload(id, fileIndex: 0);
+    } on FileDownloadInUseException catch (error) {
+      inUse = error.torrentId == id && error.fileIndex == 0;
+    }
+    _check(inUse && !engine.getFileDownloads(id).single.isPaused,
+        'playing file pause was not rejected without mutation');
+    var unselectedRejected = false;
+    try {
+      engine.resumeFileDownload(id, fileIndex: 1);
+    } on StateError {
+      unselectedRejected = true;
+    }
+    _check(unselectedRejected, 'resume implicitly selected a file');
     final next = engine.switchFile(id, fileIndex: 1);
+    engine.pauseFileDownload(id, fileIndex: 0);
+    engine.pauseFileDownload(id, fileIndex: 0);
+    engine.downloadFile(id, fileIndex: 0);
+    _check(engine.getFileDownloads(id).single.isPaused && engine.hasDownloads(id),
+        'pause lost selection or repeated download resumed it');
+    _check(engine.getStreamInfo(next.id) != null, 'pause interrupted sibling playback');
+    engine.resumeFileDownload(id, fileIndex: 0);
+    engine.resumeFileDownload(id, fileIndex: 0);
+    _check(!engine.getFileDownloads(id).single.isPaused, 'resume did not clear pause');
     engine.stopStream(next.id, keepTorrent: false);
     _check(engine.getFiles(id).length == 2 && engine.hasDownloads(id),
         'legacy stop flag removed download task');
@@ -132,4 +158,5 @@ Future<void> checkFileDownloads() async {
     await engine.dispose();
     await root.delete(recursive: true);
   }
+  await checkFileCancellation();
 }

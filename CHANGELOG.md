@@ -6,6 +6,10 @@ Historical entries describe their respective releases; see [README](README.md) f
 
 ## 2.0.1-dev.1 (unreleased)
 
+- Add `cancelFileDownload`: clear one file selection/pause without stopping playback or deleting payload immediately. Preserve sibling/shared-piece demands; checkpoint cancellation and exclude tasks with no selections. Rebuild native libraries for `lt_cancel_file_download`.
+
+- Add file-level `pauseFileDownload`/`resumeFileDownload` and `FileDownloadInfo.isPaused`. Reject pauses of files with live streams using `FileDownloadInUseException`; retain selection/data, sibling downloads and shared-piece demands. Persist pauses in resume v2 while reading v1. Rebuild matching native libraries.
+
 - Add `saveDownloadState`, `restoreDownloadState`, and infohash-based `findTorrentByMagnet`; restore downloads including completed files and ordinary magnets awaiting metadata.
 - Add `init(downloadStateDirectory:, downloadStateSaveInterval:)`, debounced/periodic checkpoints and `downloadStateErrors`. Await libtorrent resume alerts and atomically replace the state manifest; exclude playback priorities/deadlines.
 - Save before shutdown; retain the engine on checkpoint failure. Remove durable records before explicit deletion and reject stale concurrent snapshots. Validate corrupt state before restoration, preserve existing matching tasks and paused state. Rebuild native libraries for the new FFI exports.

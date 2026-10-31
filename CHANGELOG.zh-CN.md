@@ -6,6 +6,10 @@
 
 ## 2.0.1-dev.1（尚未发布）
 
+- 新增 `cancelFileDownload`：撤销单个文件缓存选择及暂停状态，不停止播放、不立即删除数据，保留其他文件与共享分片需求。取消状态随断点保存，无剩余选择的任务不再恢复。需重编译含 `lt_cancel_file_download` 的原生库。
+
+- 新增文件级 `pauseFileDownload`、`resumeFileDownload` 和 `FileDownloadInfo.isPaused`；目标文件有播放流时抛出 `FileDownloadInUseException` 拒绝暂停。暂停保留选择与数据，不影响其他文件和共享分片需求；resume v2 保存暂停状态并兼容读取 v1。需同步重编译原生库。
+
 - 新增 `saveDownloadState`、`restoreDownloadState` 和按 infohash 查询的 `findTorrentByMagnet`；仅恢复下载任务，包括已完成文件、等待元数据的普通磁力。
 - `init` 新增 `downloadStateDirectory`、`downloadStateSaveInterval`；支持变更后自动保存、定期保存和 `downloadStateErrors` 错误通知。等待 libtorrent 恢复数据回调后原子替换记录，不保存播放优先级／deadline。
 - 退出前等待保存，保存失败保留引擎供重试；显式删除先移除持久化记录，并发旧快照不能恢复已删除任务。恢复前校验损坏记录，保留已有同磁力任务的选择与暂停状态。需重编译含新增 FFI 接口的原生库。

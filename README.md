@@ -304,6 +304,60 @@ delete tasks/files. `keepTorrent` remains accepted but is ignored, including
 `disposeTorrent`/`disposeAll` explicitly delete selected downloads too. Release
 player objects separately. File deletion is asynchronous in libtorrent.
 
+### Pause and resume a cached file
+
+```dart
+try {
+  engine.pauseFileDownload(torrentId, fileIndex: episodeIndex);
+} on FileDownloadInUseException {
+  // Show: This episode is playing and cannot be paused.
+}
+final paused = engine.getFileDownloads(torrentId)
+    .firstWhere((file) => file.fileIndex == episodeIndex).isPaused;
+engine.resumeFileDownload(torrentId, fileIndex: episodeIndex);
+```
+
+Pause retains file selection, verified progress and disk data; `hasDownloads`
+remains true. It withdraws only this file's background piece demand, leaving
+other files and shared pieces active. Native code rejects pause while any stream
+owns the target file, including buffering or a player paused without `stopStream`.
+Stop all matching streams before retrying. Group pause is an application loop;
+report per-file rejections instead of marking the whole group paused.
+
+Both methods require an existing selection and are idempotent; `downloadFile`
+does not resume a paused file. `resumeFileDownload` also resumes a torrent paused
+as a whole. `setFilePriorities` replaces selections and clears file pauses.
+Playback started after a successful pause still works independently, and shared
+pieces/in-flight requests can increase paused progress. Do not use torrent-wide
+completion to decide whether a paused file is complete; use `FileDownloadInfo`.
+
+File pauses survive download-state checkpoints and restart. Resume format v2
+reads legacy v1 selections as enabled; older native libraries cannot read v2.
+Rebuild the native library together with Dart for the new exports/status field.
+
+### Cancel a cached file
+
+```dart
+engine.cancelFileDownload(torrentId, fileIndex: episodeIndex);
+await engine.saveDownloadState(stateDirectory); // confirm durable cancellation
+```
+
+Cancellation removes the file from `getFileDownloads` and clears its pause.
+It preserves active playback, other file selections and their shared pieces.
+Unlike pause, it is allowed while the target file is playing. Metadata is required;
+repeating cancellation of a valid unselected file is harmless, while invalid
+indices/tasks throw `StateError`. It does not resume a paused torrent.
+Use `downloadFile` to cache the file again; `resumeFileDownload` cannot recreate it.
+
+Cancellation does not immediately delete bytes. If this was the last selection,
+`hasDownloads` becomes false, the next checkpoint excludes the task, and normal
+`dispose()` cleanup can delete its temporary data. The same rule applies to
+ordinary (`streamOnly=false`) torrents after all files are deselected. Explicitly
+remove the torrent with `deleteFiles: true` only when it has no playback or other
+application owners. Automatic checkpoints remain asynchronous; await the explicit
+save when cancellation must be durable before exit. Rebuild native libraries for
+`lt_cancel_file_download` before using this Dart API.
+
 ### Download persistence and restart recovery
 
 Use durable application directories for **both** payload files and task state:

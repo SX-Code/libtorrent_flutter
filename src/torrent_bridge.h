@@ -75,6 +75,7 @@ typedef struct {
     int32_t file_index;
     int32_t priority;
     int32_t is_complete;
+    int32_t is_paused; /* Selection/priority retained while its background demand is paused. */
 } lt_file_download_status;
 
 typedef struct {
@@ -183,6 +184,15 @@ TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
  * download_file: 1=success, 0=error. has_downloads: 1=yes, 0=no, -1=error.
  * get_file_downloads: selected file count, or -1=error. See lt_last_error(). */
 TORRENT_API int lt_download_file(lt_session_t session, lt_torrent_id id, int file_index);
+/* File pause/resume retain selected data. 1=success, 0=invalid task/file/error.
+ * Pause additionally returns -1=file_in_use (a live stream owns this file).
+ * Resume requires an existing selection; repeated calls are idempotent. */
+TORRENT_API int lt_pause_file_download(lt_session_t session, lt_torrent_id id, int file_index);
+TORRENT_API int lt_resume_file_download(lt_session_t session, lt_torrent_id id, int file_index);
+/* Deselect a file and clear its pause, retaining streams and existing bytes.
+ * Valid unselected files succeed (idempotent). Metadata required.
+ * 1=success, 0=invalid task/file/error. Does not resume a paused torrent. */
+TORRENT_API int lt_cancel_file_download(lt_session_t session, lt_torrent_id id, int file_index);
 TORRENT_API int lt_has_downloads(lt_session_t session, lt_torrent_id id);
 TORRENT_API int lt_get_file_downloads(lt_session_t session, lt_torrent_id id,
                                      lt_file_download_status* out, int max_count);
