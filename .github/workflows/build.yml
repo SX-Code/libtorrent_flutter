@@ -107,15 +107,14 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════════════════════
   # MACOS BUILD (universal2 dylib: arm64 + x86_64, both cross-compiled on
-  # an arm64 runner — GitHub no longer offers macos-13 Intel runners as of
-  # the macos-14 / macos-15 era. Apple's clang handles -arch x86_64 fine,
+  # an arm64 runner. Apple's clang handles -arch x86_64 fine,
   # but Homebrew on Apple Silicon only ships arm64 binaries, so we
   # cross-compile OpenSSL ourselves for both slices and use Boost
   # (headers-only as far as libtorrent's compile is concerned).
   # ═══════════════════════════════════════════════════════════════════════════════
   build-macos:
     if: ${{ false }}
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - run: brew install cmake ninja
@@ -391,7 +390,7 @@ jobs:
   # iOS BUILD (static library, arm64 + x86_64 simulator)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-ios:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - run: brew install cmake ninja
