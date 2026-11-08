@@ -19,10 +19,9 @@ subprocess.run([flutter, 'create', '--platforms=' + args.platform,
                check=True, shell=False)
 tests = example / 'integration_test'
 tests.mkdir(exist_ok=True)
-shutil.copyfile(root / 'test/integration/engine_smoke.dart', tests / 'engine_test.dart')
-shutil.copyfile(root / 'test/integration/stream_start_checks.dart', tests / 'stream_start_checks.dart')
-shutil.copyfile(root / 'test/integration/file_download_checks.dart', tests / 'file_download_checks.dart')
-shutil.copyfile(root / 'test/integration/download_state_checks.dart', tests / 'download_state_checks.dart')
+for source in (root / 'test/integration').glob('*.dart'):
+    target = 'engine_test.dart' if source.name == 'engine_smoke.dart' else source.name
+    shutil.copyfile(source, tests / target)
 if args.platform == 'macos':
     for name in ['DebugProfile', 'Release']:
         path = example / 'macos/Runner' / (name + '.entitlements')
