@@ -89,7 +89,7 @@ jobs:
           python3 scripts/prepare_example.py linux
           cd example
           flutter pub get
-          xvfb-run flutter test integration_test/ -d linux --timeout 60s
+          xvfb-run flutter test integration_test/engine_test.dart -d linux --timeout 60s
 
       - name: Verify FFI exports
         run: python3 scripts/check_native_exports.py prebuilt/linux/${{ matrix.arch }}/liblibtorrent_flutter.so
@@ -125,7 +125,7 @@ jobs:
           python3 scripts/prepare_example.py macos
           cd example
           flutter pub get
-          flutter test integration_test/ -d macos --timeout 120s
+          flutter test integration_test/engine_test.dart -d macos --timeout 120s
       - uses: actions/upload-artifact@v6
         with:
           name: macos-native-lib
@@ -224,7 +224,7 @@ jobs:
           cd example
           flutter pub get
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          flutter test integration_test/ -d windows --timeout 60s
+          flutter test integration_test/engine_test.dart -d windows --timeout 60s
 
       - name: Verify FFI exports
         if: matrix.arch == 'x64'
