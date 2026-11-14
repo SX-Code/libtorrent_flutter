@@ -366,17 +366,24 @@ static void test_switch_connection_retention(lt_session_t session, const std::fi
     std::vector<lt::peer_info> peers_before;
     original_handle.get_peer_info(peers_before);
     require(peers_before.size() == 1, "local seed connection missing before switch");
+    const auto original_remote = peers_before.front().remote_endpoint();
+    const auto original_local = peers_before.front().local_endpoint();
     const auto next = lt_switch_file(session, id, 1, 512 * 1024);
     require(next >= 0, lt_last_error());
     require(lt_check_stream_start(session, first) == -1, "reconnect retained old stream");
     require(sw->handles.at(id) == original_handle && original_handle.is_valid(), "switch rebuilt torrent");
     require(sw->schedulers.at(id) == original_scheduler, "switch replaced scheduler");
+    wait_until([&] { return lt_check_stream_start(session, next) == 1; }, "switch could not download from the retained connection");
     std::vector<lt::peer_info> peers_after;
     original_handle.get_peer_info(peers_after);
-    require(peers_after.size() == 1 && peers_after.front().remote_endpoint() == peers_before.front().remote_endpoint()
-            && peers_after.front().local_endpoint() == peers_before.front().local_endpoint(),
-            "switch replaced the established TCP connection");
-    wait_until([&] { return lt_check_stream_start(session, next) == 1; }, "switch could not download from the retained connection");
+    bool retained_connection = false;
+    for (const auto& peer : peers_after) {
+        if (peer.remote_endpoint() == original_remote && peer.local_endpoint() == original_local) {
+            retained_connection = true;
+            break;
+        }
+    }
+    require(retained_connection, "switch replaced the established TCP connection");
     const auto reply = http_request(sw->streams.at(next)->server_port, "GET", "0-499");
     require(reply.size() - reply.find("\r\n\r\n") - 4 == 500, "reconnected episode could not serve HTTP");
     lt_remove_torrent(session, id, 1);

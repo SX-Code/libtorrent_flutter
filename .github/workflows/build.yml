@@ -83,10 +83,12 @@ jobs:
       - name: Run Dart smoke test
         if: matrix.arch == 'x64'
         run: |
-          python3 scripts/prepare_example.py linux
+          python3 scripts/prepare_example.py linux --host-tests
           cd example
           flutter pub get
-          xvfb-run flutter test integration_test/engine_test.dart -d linux --timeout 180s
+          xvfb-run env \
+            LD_LIBRARY_PATH="$PWD/../prebuilt/linux/x64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            flutter test test/engine_test.dart --reporter expanded --timeout 180s
 
       - name: Verify FFI exports
         run: python3 scripts/check_native_exports.py prebuilt/linux/${{ matrix.arch }}/liblibtorrent_flutter.so
@@ -122,7 +124,7 @@ jobs:
           python3 scripts/prepare_example.py macos
           cd example
           flutter pub get
-          flutter test integration_test/engine_test.dart -d macos --timeout 180s
+          flutter test integration_test/engine_test.dart -d macos --reporter expanded --timeout 180s
       - uses: actions/upload-artifact@v6
         with:
           name: macos-native-lib
@@ -218,7 +220,7 @@ jobs:
           cd example
           flutter pub get
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          flutter test integration_test/engine_test.dart -d windows --timeout 180s
+          flutter test integration_test/engine_test.dart -d windows --reporter expanded --timeout 180s
 
       - name: Verify FFI exports
         if: matrix.arch == 'x64'

@@ -9,6 +9,7 @@ import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('platform', choices=['ios', 'macos', 'android', 'linux', 'windows'])
+parser.add_argument('--host-tests', action='store_true')
 args = parser.parse_args()
 root = pathlib.Path(__file__).resolve().parent.parent
 example = root / 'example'
@@ -18,7 +19,7 @@ if flutter is None:
 subprocess.run([flutter, 'create', '--platforms=' + args.platform,
                 '--project-name', 'libtorrent_flutter_example', '.'], cwd=example,
                check=True, shell=False)
-tests = example / 'integration_test'
+tests = example / ('test' if args.host_tests else 'integration_test')
 if tests.exists():
     for stale in tests.glob('*.dart'):
         stale.unlink()

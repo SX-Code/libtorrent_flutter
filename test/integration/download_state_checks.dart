@@ -17,6 +17,34 @@ Future<void> _until(bool Function() condition, String message) async {
   }
 }
 
+Future<void> _deleteFile(File file) async {
+  FileSystemException? lastError;
+  for (var attempt = 0; attempt < 20; attempt++) {
+    try {
+      if (await file.exists()) await file.delete();
+      return;
+    } on FileSystemException catch (error) {
+      lastError = error;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+  throw lastError!;
+}
+
+Future<void> _deleteDirectory(Directory directory) async {
+  FileSystemException? lastError;
+  for (var attempt = 0; attempt < 20; attempt++) {
+    try {
+      if (await directory.exists()) await directory.delete(recursive: true);
+      return;
+    } on FileSystemException catch (error) {
+      lastError = error;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+  throw lastError!;
+}
+
 Future<void> checkDownloadState() async {
   final root = await Directory.systemTemp.createTemp('ltf_resume_');
   final state = '${root.path}/state';
@@ -124,7 +152,7 @@ Future<void> checkDownloadState() async {
       });
     }, 'automatic selection checkpoint did not update');
     await engine.dispose();
-    await payload.delete();
+    await _deleteFile(payload);
     engine = await init(directory: state);
     final missingId = engine.findTorrentByMagnet(magnet)!;
     _check(engine.getFileDownloads(missingId).length == 2,
@@ -204,7 +232,7 @@ Future<void> checkDownloadState() async {
             !LibtorrentFlutter.isInitialized &&
             manifest.readAsStringSync() == '{invalid',
         'corrupt state overwritten');
-    await manifest.delete();
+    await _deleteFile(manifest);
     engine = await init(directory: state);
 
     // A failed checkpoint leaves the engine available and dispose retryable.
@@ -229,6 +257,6 @@ Future<void> checkDownloadState() async {
     if (LibtorrentFlutter.isInitialized) {
       await LibtorrentFlutter.instance.dispose();
     }
-    await root.delete(recursive: true);
+    await _deleteDirectory(root);
   }
 }
