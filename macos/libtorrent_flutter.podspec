@@ -58,7 +58,7 @@ Pod::Spec.new do |s|
     # Use prebuilt — bundle the dylib plus OpenSSL dependencies
     openssl_dylibs = Dir.glob(File.join(__dir__, 'lib*.dylib')).map { |f| File.basename(f) }
     s.vendored_libraries = openssl_dylibs
-    s.source_files = 'Classes/**/*.swift'
+    s.source_files = 'libtorrent_flutter/Sources/libtorrent_flutter/**/*.swift'
   else
     raise 'Missing rebuilt macos native library. Run bash scripts/build_apple.sh macos from the plugin root, or set LIBTORRENT_FLUTTER_RELEASE_BASE_URL to your matching release directory.'
   end

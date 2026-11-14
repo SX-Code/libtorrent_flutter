@@ -3,6 +3,7 @@
 import argparse
 import pathlib
 import plistlib
+import re
 import shutil
 import subprocess
 
@@ -18,10 +19,23 @@ subprocess.run([flutter, 'create', '--platforms=' + args.platform,
                 '--project-name', 'libtorrent_flutter_example', '.'], cwd=example,
                check=True, shell=False)
 tests = example / 'integration_test'
-tests.mkdir(exist_ok=True)
-for source in (root / 'test/integration').glob('*.dart'):
+if tests.exists():
+    for stale in tests.glob('*.dart'):
+        stale.unlink()
+else:
+    tests.mkdir()
+for source in sorted((root / 'test/integration').glob('*.dart')):
     target = 'engine_test.dart' if source.name == 'engine_smoke.dart' else source.name
     shutil.copyfile(source, tests / target)
+relative_import = re.compile(r"""^\s*import\s+['"]([^'"]+)['"]\s*;""", re.MULTILINE)
+for test_file in tests.glob('*.dart'):
+    for imported in relative_import.findall(test_file.read_text()):
+        if imported.startswith(('dart:', 'package:')):
+            continue
+        if not (test_file.parent / imported).is_file():
+            raise SystemExit(
+                f'{test_file.name} imports missing integration source: {imported}'
+            )
 if args.platform == 'macos':
     for name in ['DebugProfile', 'Release']:
         path = example / 'macos/Runner' / (name + '.entitlements')
@@ -32,6 +46,5 @@ if args.platform == 'macos':
         with path.open('wb') as file:
             plistlib.dump(data, file)
     project = example / 'macos/Runner.xcodeproj/project.pbxproj'
-    import re
     project.write_text(re.sub(r'MACOSX_DEPLOYMENT_TARGET = [^;]+;',
                              'MACOSX_DEPLOYMENT_TARGET = 11.0;', project.read_text()))
