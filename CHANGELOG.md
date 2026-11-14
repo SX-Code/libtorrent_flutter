@@ -4,7 +4,7 @@
 
 Historical entries describe their respective releases; see [README](README.md) for current behavior.
 
-## 2.0.1-dev.1 (unreleased)
+## 2.0.1 (unreleased)
 
 - Keep playback and cached downloads on real-file storage; add/cancel operations now change only scheduler piece demand, avoiding live partfile export. Gate magnet payload until initial piece priorities are installed. Native resume snapshots use v3 with separate business selections; v1/v2 snapshots are rejected (no migration). Requires a native rebuild and engine restart.
 

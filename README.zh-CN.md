@@ -5,7 +5,7 @@
 基于 **libtorrent 2.1.1** 的 Flutter 原生绑定，内置本地 HTTP 流服务，支持边下载边播放。
 当前开发分支将 1.8.7 分支中的有界缓存和滑动下载窗口移植到 2.0.0 源码，面向 iOS、macOS、Android、Linux 和 Windows。
 
-**当前开发版本：2.0.1-dev.1。** 必须使用当前源码重新编译原生库。旧的 1.8.7 二进制与当前 Dart FFI 导出接口不兼容；项目不会再尝试从已删除的上游仓库下载原生库。
+**当前版本：2.0.1。** 必须使用当前源码重新编译原生库。旧的 1.8.7 二进制与当前 Dart FFI 导出接口不兼容；项目不会再尝试从已删除的上游仓库下载原生库。
 
 验证此分支时，建议使用本地路径依赖：
 
@@ -409,7 +409,7 @@ FlutterForegroundTask.startService(
 https://github.com/SX-Code/libtorrent_flutter/releases/download/v<pubspec-version>
 ```
 
-当前版本对应的 ZIP 构建产物应发布到 `v2.0.1-dev.1` 标签下。需要其他下载地址时，将 `LIBTORRENT_FLUTTER_RELEASE_BASE_URL` 设置为完整的 Release 目录 URL。Gradle、CMake、CocoaPods 和 `scripts/download_prebuilt.sh` 都支持该覆盖配置。
+当前版本对应的 ZIP 构建产物应发布到 `v2.0.1` 标签下。需要其他下载地址时，将 `LIBTORRENT_FLUTTER_RELEASE_BASE_URL` 设置为完整的 Release 目录 URL。Gradle、CMake、CocoaPods 和 `scripts/download_prebuilt.sh` 都支持该覆盖配置。
 
 各平台构建优先使用本地已有原生库；显式执行下载脚本会下载全部平台并替换已有文件。原生库必须与当前源码修订匹配，版本号相同并不代表 ABI 一定兼容。
 

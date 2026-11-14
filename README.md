@@ -6,7 +6,7 @@ Native **libtorrent 2.1.1** bindings for Flutter with a local HTTP streaming ser
 This development branch ports the 1.8.7 fork's bounded cache and sliding download
 window onto the 2.0.0 source snapshot. It targets iOS, macOS, Android, Linux and Windows.
 
-**Development version: 2.0.1-dev.1.** Native libraries must be rebuilt from this
+**Version: 2.0.1.** Native libraries must be rebuilt from this
 source. Old 1.8.7 binaries are incompatible with the Dart FFI exports. No default
 download from the removed upstream repository is attempted.
 
@@ -492,7 +492,7 @@ Build with `.github/workflows/build.yml` or the Apple script above. Install the
 artifacts at the paths documented in [artifact installation instructions](prebuilt/README.md).
 Missing native libraries are downloaded by default from
 `https://github.com/SX-Code/libtorrent_flutter/releases/download/v<pubspec-version>`.
-For the current version, publish the ZIP assets under tag `v2.0.1-dev.1`.
+For the current version, publish the ZIP assets under tag `v2.0.1`.
 To use a different release directory, set `LIBTORRENT_FLUTTER_RELEASE_BASE_URL`
 to its full URL. Gradle, CMake, CocoaPods and `scripts/download_prebuilt.sh`
 all support this override. Existing local libraries are used first by platform builds;

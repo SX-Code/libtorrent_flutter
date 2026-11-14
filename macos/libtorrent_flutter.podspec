@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'libtorrent_flutter'
-  s.version          = '2.0.1-dev.1'
+  s.version          = '2.0.1'
   s.summary          = 'Flutter plugin for libtorrent with built-in streaming server.'
   s.description      = <<-DESC
   Native libtorrent 2.1.1 bindings for Flutter with an integrated HTTP streaming server.

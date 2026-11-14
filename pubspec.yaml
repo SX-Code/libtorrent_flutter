@@ -3,7 +3,7 @@ description: >
   Native libtorrent 2.0 bindings for Flutter with a built-in HTTP streaming
   server for instant torrent video playback. Supports Windows, Linux, macOS,
   iOS, and Android.
-version: 2.0.1-dev.1
+version: 2.0.1
 homepage: https://github.com/SX-Code/libtorrent_flutter
 repository: https://github.com/SX-Code/libtorrent_flutter
 issue_tracker: https://github.com/SX-Code/libtorrent_flutter/issues
