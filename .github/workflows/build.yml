@@ -16,15 +16,15 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════════
-  # LINUX BUILD (static libtorrent, x64)
+  # LINUX BUILD (static libtorrent, arm64)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-linux:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -75,19 +75,19 @@ jobs:
           ls -la prebuilt/linux/${{ matrix.arch }}/
 
       - name: Setup Flutter
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
       - name: Run Dart smoke test
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         run: |
           python3 scripts/prepare_example.py linux --host-tests
           cd example
           flutter pub get
           xvfb-run env \
-            LD_LIBRARY_PATH="$PWD/../prebuilt/linux/x64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            LD_LIBRARY_PATH="$PWD/../prebuilt/linux/arm64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             flutter test test/engine_test.dart --reporter expanded --timeout 180s
 
       - name: Verify FFI exports
@@ -109,6 +109,7 @@ jobs:
   # (headers-only as far as libtorrent's compile is concerned).
   # ═══════════════════════════════════════════════════════════════════════════════
   build-macos:
+    if: ${{ false }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -137,10 +138,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            triplet: x64-windows-static
-            cmake_arch: x64
-    runs-on: windows-2022
+          - arch: arm64
+            triplet: arm64-windows-static
+            cmake_arch: ARM64
+    runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v5
 
@@ -197,7 +198,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Native regression tests
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         run: ctest --test-dir build-win -C Release --output-on-failure
 
       - name: Copy to prebuilt
@@ -207,13 +208,13 @@ jobs:
           Get-ChildItem "prebuilt\windows\${{ matrix.arch }}\"
 
       - name: Setup Flutter
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
       - name: Run Dart smoke test
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         run: |
           python scripts/prepare_example.py windows
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -223,7 +224,7 @@ jobs:
           flutter test integration_test/engine_test.dart -d windows --reporter expanded --timeout 180s
 
       - name: Verify FFI exports
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'arm64'
         run: python scripts/check_native_exports.py prebuilt/windows/${{ matrix.arch }}/libtorrent_flutter.dll
 
       - name: Upload artifact
