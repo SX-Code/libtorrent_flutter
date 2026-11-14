@@ -1682,11 +1682,16 @@ struct SessionWrapper {
                             }
                             std::lock_guard<std::mutex> slk(streams_mu);
                             auto scheduler = schedulers.find(mid);
-                            if (scheduler != schedulers.end()) {
+                            if (scheduler == schedulers.end() && mra->handle.torrent_file()) {
+                                auto inserted = schedulers.emplace(
+                                    mid,
+                                    std::make_shared<StreamScheduler>(
+                                        mra->handle, !is_stream_only));
+                                scheduler = inserted.first;
+                            }
+                            if (scheduler != schedulers.end())
                                 scheduler->second->reapply();
-                            } else if (is_stream_only) {
-                                // Registration and metadata delivery are serialized by mu.
-                                // No payload was requested while upload_mode was set.
+                            if (is_stream_only) {
                                 auto ti = mra->handle.torrent_file();
                                 if (ti) {
                                     std::vector<lt::download_priority_t> priorities(
@@ -2861,31 +2866,37 @@ static lt::add_torrent_params decode_download_resume(const char* data, int size,
         | lt::torrent_flags::default_dont_download | lt::torrent_flags::upload_mode);
     params.piece_priorities.clear();
     const auto selection = node.dict_find_list("ltf-download-selection");
-    if (!params.ti || !selection || selection.list_size() != params.ti->num_files())
-        throw std::invalid_argument("invalid download selection");
-    // Return business priorities to the restore caller, which installs them in
-    // the scheduler and replaces these with storage priorities before adding.
+    const auto paused = node.dict_find_list("ltf-paused-files");
     params.file_priorities.clear();
-    for (int i = 0; i < selection.list_size(); ++i) {
-        const auto value = selection.list_at(i);
-        if (value.type() != lt::bdecode_node::int_t || value.int_value() < 0 || value.int_value() > 7)
-            throw std::invalid_argument("invalid download priority");
-        params.file_priorities.emplace_back(static_cast<std::uint8_t>(value.int_value()));
+    if (params.ti) {
+        if (!selection || selection.list_size() != params.ti->num_files())
+            throw std::invalid_argument("invalid download selection");
+        for (int i = 0; i < selection.list_size(); ++i) {
+            const auto value = selection.list_at(i);
+            if (value.type() != lt::bdecode_node::int_t || value.int_value() < 0 || value.int_value() > 7)
+                throw std::invalid_argument("invalid download priority");
+            params.file_priorities.emplace_back(static_cast<std::uint8_t>(value.int_value()));
+        }
+    } else if (selection && selection.list_size() != 0) {
+        throw std::invalid_argument("invalid download selection");
     }
     {
-        const auto paused = node.dict_find_list("ltf-paused-files");
-        if (!paused) throw std::invalid_argument("missing paused file selection");
-        for (int i = 0; i < paused.list_size(); ++i) {
-            const auto value = paused.list_at(i);
-            if (value.type() != lt::bdecode_node::int_t)
-                throw std::invalid_argument("invalid paused file index");
-            const auto file = value.int_value();
-            if (!params.ti || file < 0 || file >= params.ti->num_files()
-                || size_t(file) >= params.file_priorities.size()
-                || params.file_priorities[size_t(file)] == lt::dont_download
-                || params.ti->files().pad_file_at(lt::file_index_t(int(file)))
-                || !paused_files.insert(int(file)).second)
-                throw std::invalid_argument("invalid paused file selection");
+        if (params.ti && !paused) throw std::invalid_argument("missing paused file selection");
+        if (!params.ti && paused && paused.list_size() != 0)
+            throw std::invalid_argument("invalid paused file selection");
+        if (paused) {
+            for (int i = 0; i < paused.list_size(); ++i) {
+                const auto value = paused.list_at(i);
+                if (value.type() != lt::bdecode_node::int_t)
+                    throw std::invalid_argument("invalid paused file index");
+                const auto file = value.int_value();
+                if (!params.ti || file < 0 || file >= params.ti->num_files()
+                    || size_t(file) >= params.file_priorities.size()
+                    || params.file_priorities[size_t(file)] == lt::dont_download
+                    || params.ti->files().pad_file_at(lt::file_index_t(int(file)))
+                    || !paused_files.insert(int(file)).second)
+                    throw std::invalid_argument("invalid paused file selection");
+            }
         }
     }
     return params;
@@ -2913,8 +2924,12 @@ TORRENT_API lt_torrent_id lt_restore_resume_data(lt_session_t session, const cha
         auto params = decode_download_resume(data, size, stream_only, paused_files);
         lt::error_code ec;
         const auto selection = params.file_priorities;
-        params.file_priorities.assign(size_t(params.ti->num_files()), lt::default_priority);
-        params.piece_priorities.assign(size_t(params.ti->num_pieces()), lt::dont_download);
+        if (params.ti) {
+            params.file_priorities.assign(size_t(params.ti->num_files()), lt::default_priority);
+            params.piece_priorities.assign(size_t(params.ti->num_pieces()), lt::dont_download);
+        } else if (stream_only) {
+            params.flags |= lt::torrent_flags::upload_mode;
+        }
         std::lock_guard<std::mutex> streams_lock(sw->streams_mu);
         std::lock_guard<std::mutex> lock(sw->mu);
         // Restore is idempotent and must never overwrite a live task's selection.
@@ -2927,7 +2942,8 @@ TORRENT_API lt_torrent_id lt_restore_resume_data(lt_session_t session, const cha
         if (ec) throw std::runtime_error(ec.message());
         const auto id = register_torrent(sw, handle, stream_only, false);
         if (handle.torrent_file()) {
-            auto scheduler = std::make_shared<StreamScheduler>(handle, true);
+            auto scheduler = std::make_shared<StreamScheduler>(
+                handle, !stream_only);
             if (!selection.empty()) scheduler->select_files(selection, paused_files);
             sw->schedulers[id] = scheduler;
         }
@@ -3271,20 +3287,6 @@ static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
     }
     if (!handle.is_valid()) { set_err("invalid handle"); return -1; }
 
-    if (switch_file) {
-        // Withdraw every old stream's demands. The scheduler preserves full-file
-        // download baselines; disk pieces and peer connections remain intact.
-        try {
-            auto owners = sw->active_stream_ids.find(torrent_id);
-            if (owners != sw->active_stream_ids.end()) {
-                const auto ids = owners->second;
-                for (auto sid : ids) stop_stream_internal(sw, sid);
-            }
-        } catch (const std::exception& error) {
-            set_err(error.what()); return -1;
-        }
-    }
-
     std::unique_lock<std::mutex> startup_lock(sw->streams_mu);
     auto s = std::make_unique<StreamEngine>();
     s->id           = sw->next_stream_id.fetch_add(1);
@@ -3304,6 +3306,33 @@ static lt_stream_id open_stream(lt_session_t session, lt_torrent_id torrent_id,
     int prot_pieces = (int)((StreamEngine::PROTECT_BYTES + s->piece_length - 1) / s->piece_length);
     s->head_end_piece  = std::min(s->start_piece + prot_pieces - 1, s->end_piece);
     s->tail_start_piece = std::max(s->end_piece - prot_pieces + 1, s->start_piece);
+
+    if (switch_file) {
+        std::shared_ptr<StreamScheduler> switch_scheduler;
+        {
+            auto& scheduler = sw->schedulers[torrent_id];
+            if (!scheduler) {
+                std::lock_guard<std::mutex> lock(sw->mu);
+                scheduler = std::make_shared<StreamScheduler>(handle, !sw->stream_only_torrents.count(torrent_id));
+            }
+            switch_scheduler = scheduler;
+        }
+        s->scheduler = switch_scheduler;
+        switch_scheduler->add_stream(s->id);
+        switch_scheduler->request(s->id, s->start_piece, 7);
+        startup_lock.unlock();
+        try {
+            auto owners = sw->active_stream_ids.find(torrent_id);
+            if (owners != sw->active_stream_ids.end()) {
+                const auto ids = owners->second;
+                for (auto sid : ids) stop_stream_internal(sw, sid);
+            }
+        } catch (const std::exception& error) {
+            switch_scheduler->remove_stream(s->id);
+            set_err(error.what()); return -1;
+        }
+        startup_lock.lock();
+    }
 
     // ── Adaptive bitrate estimation ──
     // Estimate media bitrate from file size assuming typical video duration.

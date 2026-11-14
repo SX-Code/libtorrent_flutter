@@ -1073,6 +1073,34 @@ static void test_resume_state(lt_session_t session, const std::filesystem::path&
         "malformed selection length accepted");
     lt_remove_torrent(session, restored, 1);
 
+    const std::string premetadata =
+        "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+    const auto waiting = lt_add_magnet(session, premetadata.c_str(), folder.string().c_str(), 0);
+    require(waiting > 0, "pre-metadata magnet rejected");
+    lt_pause_torrent(session, waiting);
+    require(lt_request_resume_data(session, waiting) == 1,
+        "pre-metadata resume request failed");
+    int waiting_size = 0;
+    wait_until([&] {
+        waiting_size = lt_read_resume_data(session, waiting, nullptr, 0);
+        require(waiting_size >= 0, lt_last_error());
+        return waiting_size > 0;
+    }, "pre-metadata resume alert missing");
+    std::vector<char> waiting_bytes(waiting_size);
+    require(lt_read_resume_data(session, waiting, waiting_bytes.data(), waiting_size) == waiting_size,
+        "pre-metadata resume copy failed");
+    lt_remove_torrent(session, waiting, 0);
+    require(lt_validate_resume_data(session, waiting_bytes.data(), waiting_size) == 1,
+        "pre-metadata resume rejected");
+    const auto waiting_restored =
+        lt_restore_resume_data(session, waiting_bytes.data(), waiting_size);
+    require(waiting_restored > 0
+            && lt_find_torrent_by_magnet(session, premetadata.c_str()) == waiting_restored,
+        "pre-metadata magnet not restored");
+    require(sw->schedulers.find(waiting_restored) == sw->schedulers.end(),
+        "pre-metadata restore created a scheduler");
+    lt_remove_torrent(session, waiting_restored, 1);
+
     // v2 magnets use btmh multihashes and must also deduplicate by hash.
     const std::string v2 = "magnet:?xt=urn:btmh:1220" + std::string(64, 'a');
     const auto v2id = lt_add_magnet(session, v2.c_str(), folder.string().c_str(), 0);
