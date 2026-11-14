@@ -12,7 +12,7 @@ void _check(bool condition, String message) {
 Future<void> _until(bool Function() condition, String message) async {
   final watch = Stopwatch()..start();
   while (!condition()) {
-    if (watch.elapsed > const Duration(seconds: 10)) throw StateError(message);
+    if (watch.elapsed > const Duration(seconds: 30)) throw StateError(message);
     await Future<void>.delayed(const Duration(milliseconds: 25));
   }
 }

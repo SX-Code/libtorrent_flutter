@@ -356,7 +356,13 @@ DynamicLibrary _openNativeLib() {
   } else if (Platform.isAndroid || Platform.isLinux) {
     return DynamicLibrary.open('lib$libName.so');
   } else if (Platform.isMacOS) {
-    return DynamicLibrary.open('lib$libName.dylib');
+    final process = DynamicLibrary.process();
+    try {
+      process.lookup<NativeFunction<Void Function()>>('lt_version');
+      return process;
+    } on ArgumentError {
+      return DynamicLibrary.open('lib$libName.dylib');
+    }
   } else if (Platform.isIOS) {
     return DynamicLibrary.process();
   }

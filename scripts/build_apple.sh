@@ -100,6 +100,11 @@ if [[ "$PLATFORM" == macos || "$PLATFORM" == all ]]; then
   lipo -create macos-arm64/liblibtorrent_flutter.dylib macos-x86_64/liblibtorrent_flutter.dylib \
     -output "$ROOT/prebuilt/macos/universal/liblibtorrent_flutter.dylib"
   cp "$ROOT/prebuilt/macos/universal/liblibtorrent_flutter.dylib" "$ROOT/macos/"
+  binary_output="$ROOT/macos/libtorrent_flutter/Binary/libtorrent_flutter.xcframework"
+  if [[ -d "$binary_output" ]]; then rm -rf "$binary_output"; fi
+  xcodebuild -create-xcframework \
+    -library "$ROOT/prebuilt/macos/universal/liblibtorrent_flutter.dylib" \
+    -output "$binary_output"
 fi
 if [[ "$PLATFORM" == ios || "$PLATFORM" == all ]]; then
   build_slice ios arm64 iphoneos arm64-apple-ios13.0 ios64-xcrun

@@ -34,6 +34,13 @@ download_and_extract "linux-native-lib-arm64" "prebuilt/linux/arm64"
 download_and_extract "macos-native-lib" "prebuilt/macos"
 mkdir -p macos
 cp prebuilt/macos/universal/liblibtorrent_flutter.dylib macos/
+if command -v xcodebuild >/dev/null 2>&1; then
+  binary_output="macos/libtorrent_flutter/Binary/libtorrent_flutter.xcframework"
+  rm -rf "$binary_output"
+  xcodebuild -create-xcframework \
+    -library prebuilt/macos/universal/liblibtorrent_flutter.dylib \
+    -output "$binary_output"
+fi
 
 # Windows
 download_and_extract "windows-native-lib-x64"   "prebuilt/windows/x64"

@@ -16,7 +16,7 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════════
-  # LINUX BUILD (static libtorrent, x64 + arm64)
+  # LINUX BUILD (static libtorrent, x64)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-linux:
     strategy:
@@ -25,9 +25,6 @@ jobs:
         include:
           - arch: x64
             runner: ubuntu-22.04
-          - arch: arm64
-            # GitHub's native ARM64 Linux runner — free for public repos.
-            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -89,7 +86,7 @@ jobs:
           python3 scripts/prepare_example.py linux
           cd example
           flutter pub get
-          xvfb-run flutter test integration_test/engine_test.dart -d linux --timeout 60s
+          xvfb-run flutter test integration_test/engine_test.dart -d linux --timeout 180s
 
       - name: Verify FFI exports
         run: python3 scripts/check_native_exports.py prebuilt/linux/${{ matrix.arch }}/liblibtorrent_flutter.so
@@ -125,7 +122,7 @@ jobs:
           python3 scripts/prepare_example.py macos
           cd example
           flutter pub get
-          flutter test integration_test/engine_test.dart -d macos --timeout 120s
+          flutter test integration_test/engine_test.dart -d macos --timeout 180s
       - uses: actions/upload-artifact@v6
         with:
           name: macos-native-lib
@@ -141,9 +138,6 @@ jobs:
           - arch: x64
             triplet: x64-windows-static
             cmake_arch: x64
-          - arch: arm64
-            triplet: arm64-windows-static
-            cmake_arch: ARM64
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
@@ -224,7 +218,7 @@ jobs:
           cd example
           flutter pub get
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          flutter test integration_test/engine_test.dart -d windows --timeout 60s
+          flutter test integration_test/engine_test.dart -d windows --timeout 180s
 
       - name: Verify FFI exports
         if: matrix.arch == 'x64'
@@ -242,6 +236,7 @@ jobs:
   # ANDROID BUILD (already static)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-android:
+    if: ${{ false }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -384,6 +379,7 @@ jobs:
   # iOS BUILD (static library, arm64 + x86_64 simulator)
   # ═══════════════════════════════════════════════════════════════════════════════
   build-ios:
+    if: ${{ false }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5

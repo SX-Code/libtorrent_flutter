@@ -9,6 +9,7 @@
 /ios/*.a
 /ios/*.xcframework/
 /macos/*.dylib
+/macos/libtorrent_flutter/Binary/
 **/Pods/
 **/.symlinks/
 **/.dart_tool/
